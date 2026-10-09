@@ -51,6 +51,11 @@
     "default": 300,
     "hint": "群里超过该时间没有新消息，会话自动结束"
   },
+  "list_limit": {
+    "description": "/issue list 最多显示条数",
+    "type": "int",
+    "default": 50
+  },
   "require_at": {
     "description": "群聊中发起时必须 @机器人",
     "type": "bool",
