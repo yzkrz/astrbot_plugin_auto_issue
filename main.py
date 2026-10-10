@@ -114,7 +114,7 @@ class IssueSessionFilter(SessionFilter):
     PLUGIN_NAME,
     "YourName",
     "群聊需求转 GitHub Issue：AI 多轮追问补全细节，预览确认后发布",
-    "1.1.0",
+    "1.2.0",
 )
 class AutoIssuePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):

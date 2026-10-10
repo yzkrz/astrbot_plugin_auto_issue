@@ -1,6 +1,6 @@
 name: astrbot_plugin_kunter_auto_issue
 display_name: 群聊需求提交 GitHub Issue
 desc: 在群聊中 @机器人 发起需求/问题反馈，AI 多轮追问补全细节，整理后预览确认并发布为 GitHub Issue。
-version: v1.1.0
+version: v1.2.0
 author: YourName
 repo: https://github.com/yzkrz/astrbot_plugin_kunter_auto_issue
