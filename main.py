@@ -38,13 +38,22 @@ DETAIL_COMMENT_COUNT = 3
 
 OUTPUT_FORMAT_PROMPT = """
 # 输出格式（必须严格遵守）
-只输出一个 JSON 对象，不要输出任何其他文字，不要使用 Markdown 代码块包裹。可选的三种形式：
+只输出一个 JSON 对象，不要输出任何其他文字，不要使用 Markdown 代码块包裹。可选的四种形式：
 1. 信息不足，需要继续追问：
 {"action": "ask", "message": "发给群友的追问内容"}
 2. 信息已经充足，生成 issue 草稿：
 {"action": "draft", "issues": [{"title": "issue 标题", "body": "issue 正文（Markdown）"__LABELS_FIELD__, "images": [1, 2]}]}
-3. 最新的消息是与当前 issue 无关的群聊闲聊，不需要回应：
+3. 最新的消息是群友之间的闲聊，并不是在向你反馈，不需要回应：
 {"action": "ignore"}
+4. 最新的消息是在向你反馈，但内容与本项目的开发无关，拒绝生成 issue：
+{"action": "reject", "message": "简短友好地说明为什么不能生成 issue"}
+
+# 相关性规则
+- 只有与本项目开发相关的内容才能生成 issue，例如 Bug、功能需求、文档问题、使用问题、性能或兼容性问题。
+- 八卦、娱乐、时事、私人话题、广告、与本项目无关的其他软件或产品问题等，一律不能生成 issue：如果是在向你反馈，输出 reject；如果只是群友闲聊，输出 ignore。
+- 是否相关以“项目背景”为准；拿不准时可以追问这件事和项目有什么关系。
+- 一条消息里既有相关内容又有无关内容时，只为相关部分生成 issue，无关部分直接舍弃。
+- 要求立即生成草稿时，如果记录里没有任何与项目相关的内容，输出 reject。
 
 # 拆分规则
 - 如果群友反馈中包含多个相互独立的问题或需求，必须拆分为多个 issue，放在 issues 数组中，每个 issue 只描述一件事。
@@ -76,6 +85,8 @@ class IssueSession:
     ask_rounds: int = 0
     drafts: list[IssueDraft] = field(default_factory=list)
     closed: bool = False
+    # 记录最近一条消息之前的状态，用于撤销无关消息：(对话条数, 图片数, 参与者)
+    mark: tuple[int, int, dict[str, str]] | None = None
 
 
 class IssueSessionFilter(SessionFilter):
@@ -244,6 +255,7 @@ class AutoIssuePlugin(Star):
 
         force_draft = lowered in FORCE_DRAFT_WORDS
         if force_draft:
+            self._save_mark(state)
             state.transcript.append(
                 ("user", self._speaker(event), "（请根据已有信息直接生成 issue 草稿）")
             )
@@ -322,6 +334,17 @@ class AutoIssuePlugin(Star):
 
         action = result.get("action")
         if action == "ignore" and not force_draft:
+            self._rollback(state)
+            return
+
+        if action == "reject":
+            self._rollback(state)
+            message = str(result.get("message") or "").strip() or "这与项目开发无关，无法生成 issue。"
+            if state.drafts:
+                message += f"\n当前 {len(state.drafts)} 个草稿不受影响，可回复「确认」发布或继续修改。"
+            else:
+                message += "\n如有项目相关的问题请继续描述，或发送「取消」退出。"
+            await event.send(event.plain_result(message))
             return
 
         drafts = self._parse_drafts(state, result) if action == "draft" else []
@@ -384,7 +407,10 @@ class AutoIssuePlugin(Star):
                 "请输出修改后的完整草稿列表（action=draft，包含所有仍需发布的 issue）。"
             )
         if must_draft:
-            parts.append("# 要求\n不要再追问，请根据已有信息立即输出 action=draft 的 JSON。")
+            parts.append(
+                "# 要求\n不要再追问，请根据已有信息立即输出 action=draft 的 JSON；"
+                "如果没有任何与项目相关的内容，输出 action=reject。"
+            )
         else:
             parts.append(f"# 状态\n已追问 {state.ask_rounds} 轮。请根据最新消息决定下一步。")
 
@@ -621,6 +647,7 @@ class AutoIssuePlugin(Star):
 
     def _record_message(self, state: IssueSession, event: AstrMessageEvent, text: str) -> bool:
         """记录一条群友消息，返回是否包含有效内容。"""
+        self._save_mark(state)
         first_new = len(state.image_urls) + 1
         new_images = self._record_images(state, event)
         if not text and not new_images:
@@ -632,6 +659,21 @@ class AutoIssuePlugin(Star):
         state.transcript.append(("user", self._speaker(event), content.strip()))
         state.participants[str(event.get_sender_id())] = event.get_sender_name()
         return True
+
+    @staticmethod
+    def _save_mark(state: IssueSession):
+        state.mark = (len(state.transcript), len(state.image_urls), dict(state.participants))
+
+    @staticmethod
+    def _rollback(state: IssueSession):
+        """撤销最近一条被判定为无关的消息，避免混入 issue 和参与者名单。"""
+        if state.mark is None:
+            return
+        transcript_len, image_len, participants = state.mark
+        del state.transcript[transcript_len:]
+        del state.image_urls[image_len:]
+        state.participants = participants
+        state.mark = None
 
     def _record_images(self, state: IssueSession, event: AstrMessageEvent) -> int:
         count = 0
