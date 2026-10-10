@@ -1,4 +1,4 @@
-# astrbot_plugin_kunter_auto_issue
+# astrbot_plugin_auto_issue
 
 在用户交流群中收集需求 / Bug 反馈，由 AI 多轮追问补全细节，整理成规范的 GitHub Issue，经确认后自动发布到指定仓库。
 
@@ -53,6 +53,8 @@
 | --- | --- |
 | GitHub 仓库 | `owner/repo` 或完整 URL |
 | GitHub Token | 推荐使用 Fine-grained token，只授予目标仓库 **Issues: Read and write** 权限 |
+| 用户 Token 绑定 | 为聊天用户（填平台用户 ID，如 QQ 号）绑定其本人的 GitHub Token，该用户发起的 issue 和评论会以其 GitHub 账号创建 |
+| 未绑定的用户使用默认 Token 提交 | 默认开启；关闭后未绑定的用户只能查询，不能发起 issue 或评论 |
 | list 最多显示条数 | `/issue list` 的显示上限，默认 50 |
 | 使用的大模型 | 留空使用当前会话模型 |
 | AI 提示词 / 项目背景介绍 | 控制追问风格、issue 格式，并让 AI 了解项目 |

@@ -17,7 +17,7 @@ from astrbot.core.utils.session_waiter import (
     session_waiter,
 )
 
-PLUGIN_NAME = "astrbot_plugin_kunter_auto_issue"
+PLUGIN_NAME = "astrbot_plugin_auto_issue"
 
 CANCEL_WORDS = {"取消", "退出", "结束", "算了", "cancel", "quit", "exit"}
 FORCE_DRAFT_WORDS = {"生成", "直接生成", "生成草稿", "够了", "就这些", "没有了"}
@@ -31,6 +31,8 @@ USAGE = (
     "/issue <编号> 查看 issue 详情\n"
     "/issue <编号> <内容> 为 issue 添加评论"
 )
+
+NO_TOKEN_TIP = "你还没有绑定 GitHub Token，无法提交 issue 或评论，请联系管理员在插件配置页绑定。"
 
 BODY_PREVIEW_LIMIT = 800
 COMMENT_PREVIEW_LIMIT = 200
@@ -114,7 +116,7 @@ class IssueSessionFilter(SessionFilter):
     PLUGIN_NAME,
     "YourName",
     "群聊需求转 GitHub Issue：AI 多轮追问补全细节，预览确认后发布",
-    "1.2.0",
+    "1.3.0",
 )
 class AutoIssuePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -126,13 +128,16 @@ class AutoIssuePlugin(Star):
     @filter.command("issue", alias={"反馈"})
     async def issue(self, event: AstrMessageEvent):
         """/issue 新建 | /issue list 列出 open issue | /issue <id> 查看详情 | /issue <id> <内容> 评论"""
-        deny_reason = self._check_permission(event) or self._check_configured()
+        deny_reason = self._check_permission(event) or self._check_configured(event)
         if deny_reason:
             yield event.plain_result(deny_reason)
             return
 
         _, args = self._strip_command(event.message_str)
         if not args:
+            if not self._token_for(str(event.get_sender_id()), write=True):
+                yield event.plain_result(NO_TOKEN_TIP)
+                return
             async for result in self._run_new_session(event):
                 yield result
             return
@@ -155,11 +160,14 @@ class AutoIssuePlugin(Star):
         return ("comment", number, comment) if comment else ("detail", number)
 
     async def _handle_query(self, event: AstrMessageEvent, query: tuple) -> str:
+        sender = str(event.get_sender_id())
+        if query[0] == "comment" and not self._token_for(sender, write=True):
+            return NO_TOKEN_TIP
         try:
             if query[0] == "list":
-                return await self._list_issues()
+                return await self._list_issues(self._token_for(sender))
             if query[0] == "detail":
-                return await self._issue_detail(query[1])
+                return await self._issue_detail(query[1], self._token_for(sender))
             return await self._add_comment(event, query[1], query[2])
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] query {query[0]} failed: {e}")
@@ -474,12 +482,17 @@ class AutoIssuePlugin(Star):
     # ------------------------------------------------------------------ GitHub
 
     async def _github(
-        self, method: str, path: str, payload: dict | None = None, params: dict | None = None
+        self,
+        method: str,
+        path: str,
+        token: str,
+        payload: dict | None = None,
+        params: dict | None = None,
     ) -> tuple[int, Any]:
         repo = self._parse_repo(self.config.get("github_repo", ""))
         api_base = (self.config.get("github_api_base") or "https://api.github.com").rstrip("/")
         headers = {
-            "Authorization": f"Bearer {self.config.get('github_token', '')}",
+            "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": PLUGIN_NAME,
@@ -497,6 +510,8 @@ class AutoIssuePlugin(Star):
 
     @staticmethod
     def _api_error(status: int, data) -> RuntimeError:
+        if status == 401:
+            return RuntimeError("GitHub Token 无效或已过期，请联系管理员更新")
         if status == 404:
             return RuntimeError("未找到（请检查 issue 编号、仓库地址及 Token 权限）")
         message = data.get("message") if isinstance(data, dict) else data
@@ -507,18 +522,21 @@ class AutoIssuePlugin(Star):
         if draft.labels:
             payload["labels"] = draft.labels
 
-        status, data = await self._github("POST", "/issues", payload)
+        token = self._token_for(state.initiator_id, write=True)
+        if not token:
+            raise RuntimeError("发起人未绑定 GitHub Token")
+        status, data = await self._github("POST", "/issues", token, payload)
         if status == 422 and "labels" in payload:
             # 标签无效时去掉标签重试
             logger.warning(f"[{PLUGIN_NAME}] 带标签创建失败，去掉标签重试：{data}")
             payload.pop("labels")
-            status, data = await self._github("POST", "/issues", payload)
+            status, data = await self._github("POST", "/issues", token, payload)
 
         if status != 201:
             raise self._api_error(status, data)
         return data.get("html_url", "")
 
-    async def _list_issues(self) -> str:
+    async def _list_issues(self, token: str) -> str:
         limit = max(1, int(self.config.get("list_limit", 50)))
         issues: list[dict] = []
         has_more = False
@@ -527,6 +545,7 @@ class AutoIssuePlugin(Star):
             status, data = await self._github(
                 "GET",
                 "/issues",
+                token,
                 params={"state": "open", "per_page": 100, "page": page},
             )
             if status != 200:
@@ -553,8 +572,8 @@ class AutoIssuePlugin(Star):
         lines.append("发送 /issue <编号> 查看详情")
         return "\n".join(lines)
 
-    async def _issue_detail(self, number: int) -> str:
-        status, data = await self._github("GET", f"/issues/{number}")
+    async def _issue_detail(self, number: int, token: str) -> str:
+        status, data = await self._github("GET", f"/issues/{number}", token)
         if status != 200:
             raise self._api_error(status, data)
 
@@ -572,7 +591,7 @@ class AutoIssuePlugin(Star):
             # 取最后一页的末尾几条评论
             last_page = (data["comments"] - 1) // 100 + 1
             c_status, comments = await self._github(
-                "GET", f"/issues/{number}/comments", params={"per_page": 100, "page": last_page}
+                "GET", f"/issues/{number}/comments", token, params={"per_page": 100, "page": last_page}
             )
             if c_status == 200 and comments:
                 lines += ["", f"💬 最近 {min(len(comments), DETAIL_COMMENT_COUNT)} 条评论："]
@@ -596,7 +615,10 @@ class AutoIssuePlugin(Star):
                 f"在 {event.get_platform_name()} {source}通过 AstrBot 提交"
             )
 
-        status, data = await self._github("POST", f"/issues/{number}/comments", {"body": body})
+        token = self._token_for(str(event.get_sender_id()), write=True)
+        status, data = await self._github(
+            "POST", f"/issues/{number}/comments", token, {"body": body}
+        )
         if status != 201:
             raise self._api_error(status, data)
         return f"已评论 #{number}：{data.get('html_url', '')}"
@@ -737,12 +759,28 @@ class AutoIssuePlugin(Star):
         allowed = set(self._available_labels())
         return [str(x).strip() for x in labels if str(x).strip() in allowed][:3]
 
-    def _check_configured(self) -> str | None:
-        if not self._parse_repo(self.config.get("github_repo", "")) or not self.config.get(
-            "github_token"
+    def _check_configured(self, event: AstrMessageEvent) -> str | None:
+        if not self._parse_repo(self.config.get("github_repo", "")) or not self._token_for(
+            str(event.get_sender_id())
         ):
             return "插件尚未配置 GitHub 仓库或 Token，请联系管理员在插件配置页填写。"
         return None
+
+    def _token_for(self, user_id: str, write: bool = False) -> str:
+        """获取用户使用的 Token：优先使用绑定的 Token，否则使用默认 Token。
+
+        write 为 True 且关闭了「未绑定用户使用默认 Token」时，未绑定用户返回空字符串。
+        """
+        for item in self.config.get("user_tokens", []) or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("user_id", "")).strip() == user_id:
+                token = str(item.get("token", "")).strip()
+                if token:
+                    return token
+        if write and not self.config.get("fallback_to_default_token", True):
+            return ""
+        return str(self.config.get("github_token", "")).strip()
 
     def _check_permission(self, event: AstrMessageEvent) -> str | None:
         """返回拒绝原因，允许时返回 None。"""

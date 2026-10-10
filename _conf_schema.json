@@ -7,12 +7,51 @@
     "obvious_hint": true
   },
   "github_token": {
-    "description": "GitHub Token",
+    "description": "默认 GitHub Token",
     "type": "string",
     "default": "",
     "secret": true,
-    "hint": "推荐使用 Fine-grained token，只授予目标仓库的 Issues: Read and write 权限",
+    "hint": "用于查询 issue，以及未在「用户 Token 绑定」中绑定的用户提交 issue / 评论。推荐使用 Fine-grained token，只授予目标仓库的 Issues: Read and write 权限",
     "obvious_hint": true
+  },
+  "user_tokens": {
+    "description": "用户 Token 绑定",
+    "type": "template_list",
+    "hint": "为聊天用户绑定其本人的 GitHub Token，该用户发起的 issue 和评论将以其 GitHub 账号创建",
+    "templates": {
+      "binding": {
+        "name": "用户绑定",
+        "display_item": "note",
+        "hide_hint_in_list": true,
+        "items": {
+          "note": {
+            "description": "备注",
+            "type": "string",
+            "default": "",
+            "hint": "仅用于在列表中区分，例如 GitHub 用户名或群昵称"
+          },
+          "user_id": {
+            "description": "聊天平台用户 ID",
+            "type": "string",
+            "default": "",
+            "hint": "如 QQ 号，需与 issue 中提交者信息里括号内的 ID 一致"
+          },
+          "token": {
+            "description": "该用户的 GitHub Token",
+            "type": "string",
+            "default": "",
+            "secret": true,
+            "hint": "需要目标仓库的 Issues: Read and write 权限"
+          }
+        }
+      }
+    }
+  },
+  "fallback_to_default_token": {
+    "description": "未绑定的用户使用默认 Token 提交",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后，未绑定 Token 的用户不能发起 issue 或评论（仍可查询）"
   },
   "github_api_base": {
     "description": "GitHub API 地址",
