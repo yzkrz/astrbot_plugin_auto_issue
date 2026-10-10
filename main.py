@@ -1,8 +1,11 @@
 import asyncio
 import json
 import re
+import shutil
 import time
+import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -10,7 +13,7 @@ import aiohttp
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.session_waiter import (
     USER_SESSIONS,
     SessionController,
@@ -84,7 +87,10 @@ class IssueDraft:
 
 @dataclass
 class ImageItem:
+    # 聊天平台的原始图片链接，用作 issue 插图；拿不到时为空
     url: str
+    # 插件数据目录中的本地副本，用于识图；拿不到时为空
+    local_path: str
     sender: str
     # 同一条消息中的文字，帮助模型理解图片
     context: str
@@ -136,12 +142,21 @@ class IssueSessionFilter(SessionFilter):
     PLUGIN_NAME,
     "YourName",
     "群聊需求转 GitHub Issue：AI 多轮追问补全细节，预览确认后发布",
-    "1.4.0",
+    "1.4.1",
 )
 class AutoIssuePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self.image_dir: Path | None = None
+        try:
+            self.image_dir = StarTools.get_data_dir(PLUGIN_NAME) / "images"
+            # 清理上次运行残留的图片副本
+            shutil.rmtree(self.image_dir, ignore_errors=True)
+            self.image_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 无法创建图片目录，将直接使用临时文件识图：{e}")
+            self.image_dir = None
 
     # ------------------------------------------------------------------ 指令
 
@@ -237,6 +252,7 @@ class AutoIssuePlugin(Star):
             logger.error(f"[{PLUGIN_NAME}] session error: {e}", exc_info=True)
             yield event.plain_result(f"issue 收集会话异常结束：{e}")
         finally:
+            self._discard_images(state.images)
             event.stop_event()
 
     async def _on_session_message(
@@ -390,6 +406,7 @@ class AutoIssuePlugin(Star):
             # 收集到的内容整体无关：清空记录，回到收集阶段
             message = str(result.get("message") or "").strip() or "这与项目开发无关，无法生成 issue。"
             state.transcript.clear()
+            self._discard_images(state.images)
             state.images.clear()
             state.participants = {state.initiator_id: state.initiator_name}
             state.mark = None
@@ -444,7 +461,9 @@ class AutoIssuePlugin(Star):
         """用模型识别尚未识别的图片，提取其中的有用信息。"""
         if not self.config.get("image_recognition", True):
             return
-        pending = [img for img in state.images if img.description is None]
+        pending = [
+            img for img in state.images if img.description is None and (img.local_path or img.url)
+        ]
         if not pending:
             return
         provider_id = await self._provider_id(event, "image_provider_id")
@@ -458,7 +477,7 @@ class AutoIssuePlugin(Star):
                 resp = await self.context.llm_generate(
                     chat_provider_id=provider_id,
                     prompt=full_prompt,
-                    image_urls=[img.url],
+                    image_urls=[img.local_path or img.url],
                 )
                 img.description = (resp.completion_text or "").strip() or "（未识别出内容）"
             except Exception as e:
@@ -701,7 +720,7 @@ class AutoIssuePlugin(Star):
     async def _add_comment(self, event: AstrMessageEvent, number: int, text: str) -> str:
         body = text
         if self.config.get("include_images", True):
-            urls = [u for u in (self._image_url(c) for c in event.get_messages()) if u]
+            urls = [url for url, _ in self._extract_images(event) if url]
             if urls:
                 body += "\n\n" + "\n".join(f"![image{i}]({u})" for i, u in enumerate(urls, 1))
         if self.config.get("append_submitter_info", True):
@@ -727,6 +746,7 @@ class AutoIssuePlugin(Star):
                 urls = [img.url for img in state.images]
             else:
                 urls = [state.images[i - 1].url for i in draft.images]
+            urls = [u for u in urls if u]
             if urls:
                 images = "\n".join(f"![image{i}]({u})" for i, u in enumerate(urls, 1))
                 body += f"\n\n### 附件图片\n\n{images}"
@@ -789,27 +809,85 @@ class AutoIssuePlugin(Star):
             return
         transcript_len, image_len, participants = state.mark
         del state.transcript[transcript_len:]
+        self._discard_images(state.images[image_len:])
         del state.images[image_len:]
         state.participants = participants
         state.mark = None
 
     def _record_images(self, state: IssueSession, event: AstrMessageEvent, context: str) -> int:
-        known = {img.url for img in state.images}
+        known = {img.url for img in state.images if img.url}
         count = 0
-        for comp in event.get_messages():
-            url = self._image_url(comp)
-            if url and url not in known:
-                state.images.append(ImageItem(url, self._speaker(event), context))
+        for url, local in self._extract_images(event):
+            if url and url in known:
+                continue
+            state.images.append(ImageItem(url, self._copy_image(local), self._speaker(event), context))
+            if url:
                 known.add(url)
-                count += 1
+            count += 1
         return count
 
+    def _extract_images(self, event: AstrMessageEvent) -> list[tuple[str, str]]:
+        """返回消息中每张图片的 (原始链接, 本地文件)。
+
+        AstrBot 的预处理阶段会把图片下载为本地临时文件，并用本地路径覆盖组件的 url，
+        所以原始链接需要从平台的原始消息中找回。
+        """
+        raw_urls = self._raw_image_urls(event)
+        result = []
+        index = 0
+        for comp in event.get_messages():
+            if not isinstance(comp, Comp.Image):
+                continue
+            refs = [r for r in (comp.url, comp.file, comp.path) if r]
+            url = next((r for r in refs if self._is_http(r)), "")
+            if not url and index < len(raw_urls):
+                url = raw_urls[index]
+            local = next((r for r in refs if not self._is_http(r) and Path(r).is_file()), "")
+            index += 1
+            if url or local:
+                result.append((url, local))
+        return result
+
+    def _raw_image_urls(self, event: AstrMessageEvent) -> list[str]:
+        """从 OneBot（aiocqhttp）原始消息中按顺序取出图片链接，取不到的位置为空字符串。"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        try:
+            segments = raw.get("message") if hasattr(raw, "get") else getattr(raw, "message", None)
+        except Exception:
+            return []
+        if not isinstance(segments, list):
+            return []
+        urls = []
+        for seg in segments:
+            if isinstance(seg, dict) and seg.get("type") == "image":
+                data = seg.get("data") or {}
+                url = str(data.get("url") or data.get("file") or "")
+                urls.append(url if self._is_http(url) else "")
+        return urls
+
+    def _copy_image(self, local: str) -> str:
+        """把预处理阶段的临时文件复制到插件目录，避免在发送「生成」前被清理。"""
+        if not local or self.image_dir is None:
+            return local
+        try:
+            target = self.image_dir / f"{uuid.uuid4().hex}{Path(local).suffix}"
+            shutil.copyfile(local, target)
+            return str(target)
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 复制图片失败：{e}")
+            return local
+
+    def _discard_images(self, images: list[ImageItem]):
+        if self.image_dir is None:
+            return
+        for img in images:
+            path = img.local_path
+            if path and Path(path).parent == self.image_dir:
+                Path(path).unlink(missing_ok=True)
+
     @staticmethod
-    def _image_url(comp) -> str:
-        if not isinstance(comp, Comp.Image):
-            return ""
-        url = comp.url or comp.file or ""
-        return url if url.startswith(("http://", "https://")) else ""
+    def _is_http(ref: str) -> bool:
+        return ref.startswith(("http://", "https://"))
 
     @staticmethod
     def _speaker(event: AstrMessageEvent) -> str:
@@ -835,7 +913,8 @@ class AutoIssuePlugin(Star):
             lines += ["", f"【{idx}】{d.title}" if multi else f"标题：{d.title}"]
             if d.labels:
                 lines.append(f"标签：{', '.join(d.labels)}")
-            image_count = len(state.images) if d.images is None else len(d.images)
+            picked = state.images if d.images is None else [state.images[i - 1] for i in d.images]
+            image_count = sum(1 for img in picked if img.url)
             if image_count and self.config.get("include_images", True):
                 lines.append(f"附件图片：{image_count} 张")
             lines += ["", d.body]
