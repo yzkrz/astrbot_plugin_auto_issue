@@ -130,11 +130,24 @@
     "default": true,
     "hint": "直接引用聊天平台提供的图片 URL，部分平台的图片链接可能会过期"
   },
-  "send_images_to_llm": {
-    "description": "将图片发送给大模型识别",
+  "image_recognition": {
+    "description": "识别图片内容",
     "type": "bool",
-    "default": false,
-    "hint": "需要所选模型支持图片输入"
+    "default": true,
+    "hint": "整理前先用模型识别群友发送的图片，提取报错、日志、版本号等信息写进 issue。需要识图模型支持图片输入"
+  },
+  "image_provider_id": {
+    "description": "识图模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空则使用上面的「使用的大模型」（再留空则为当前会话模型）。整理用的模型不支持图片时，可在这里单独指定一个视觉模型"
+  },
+  "image_prompt": {
+    "description": "识图提示词",
+    "type": "text",
+    "default": "请识别这张图片，提取其中与软件问题反馈相关的有用信息，例如报错信息、日志、版本号、界面状态、操作步骤、配置内容等，关键文字请原样摘录。用中文简洁描述，不超过 300 字。如果图片与软件无关（如表情包、风景照），只回答“无关图片”。",
+    "hint": "每张图片单独识别一次，识别结果会提供给整理 issue 的模型"
   },
   "allow_private": {
     "description": "允许私聊使用",

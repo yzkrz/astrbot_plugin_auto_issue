@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import time
@@ -20,7 +21,7 @@ from astrbot.core.utils.session_waiter import (
 PLUGIN_NAME = "astrbot_plugin_auto_issue"
 
 CANCEL_WORDS = {"取消", "退出", "结束", "算了", "cancel", "quit", "exit"}
-FORCE_DRAFT_WORDS = {"生成", "直接生成", "生成草稿", "够了", "就这些", "没有了"}
+START_WORD = "生成"
 CONFIRM_PATTERN = re.compile(r"(确认发布|确认|发布|提交|确定|ok|yes|y)\s*([\d\s,，、]*)")
 COMMAND_PATTERN = re.compile(r"^\s*/?(issue|反馈)(?:\s+|$)", re.I)
 
@@ -56,13 +57,20 @@ OUTPUT_FORMAT_PROMPT = """
 - 是否相关以“项目背景”为准；拿不准时可以追问这件事和项目有什么关系。
 - 一条消息里既有相关内容又有无关内容时，只为相关部分生成 issue，无关部分直接舍弃。
 - 要求立即生成草稿时，如果记录里没有任何与项目相关的内容，输出 reject。
+- 收集阶段的群聊记录中可能夹杂群友闲聊，整理时只采纳与项目相关的内容。
 
 # 拆分规则
 - 如果群友反馈中包含多个相互独立的问题或需求，必须拆分为多个 issue，放在 issues 数组中，每个 issue 只描述一件事。
 - 同一个问题的不同表现、补充信息不要拆分。
 - 追问时可以同时针对多个问题提问。
 - images 填写与该 issue 相关的图片编号（见群聊记录中的“图片 #编号”），没有相关图片时填 []。
+
+# 图片
+- “图片识别结果”是对群友所发图片的识别摘录，请把其中有用的信息（报错、日志、版本号、界面状态等）整理进 issue 正文。
+- 与问题无关的图片（表情包等）不要放进 images。
 """
+
+IMAGE_CONTEXT_PROMPT = "发送者在同一条消息中附带的文字：{context}"
 
 
 @dataclass
@@ -75,6 +83,16 @@ class IssueDraft:
 
 
 @dataclass
+class ImageItem:
+    url: str
+    sender: str
+    # 同一条消息中的文字，帮助模型理解图片
+    context: str
+    # 模型识别结果，None 表示尚未识别
+    description: str | None = None
+
+
+@dataclass
 class IssueSession:
     initiator_id: str
     initiator_name: str
@@ -82,8 +100,10 @@ class IssueSession:
     platform: str
     # (角色, 发言人, 内容)，角色为 user / assistant
     transcript: list[tuple[str, str, str]] = field(default_factory=list)
-    image_urls: list[str] = field(default_factory=list)
+    images: list[ImageItem] = field(default_factory=list)
     participants: dict[str, str] = field(default_factory=dict)
+    # 是否已发送「生成」开始整理；之前只记录消息，不调用 AI
+    started: bool = False
     ask_rounds: int = 0
     drafts: list[IssueDraft] = field(default_factory=list)
     closed: bool = False
@@ -116,7 +136,7 @@ class IssueSessionFilter(SessionFilter):
     PLUGIN_NAME,
     "YourName",
     "群聊需求转 GitHub Issue：AI 多轮追问补全细节，预览确认后发布",
-    "1.3.0",
+    "1.4.0",
 )
 class AutoIssuePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -190,10 +210,10 @@ class AutoIssuePlugin(Star):
         state.participants[state.initiator_id] = state.initiator_name
 
         yield event.plain_result(
-            "📝 已进入 issue 生成模式，接下来的消息都会被记录。\n"
-            "请描述你遇到的问题或想要的功能（可以一次说多个，我会拆分成多个 issue），"
-            "我会继续追问一些细节后整理成 issue。\n"
-            "发送「生成」直接出草稿，「取消」退出。"
+            "📝 已进入 issue 生成模式，接下来的文字和图片都会被记录。\n"
+            "请描述你遇到的问题或想要的功能，可以分多条发送，也可以一次说多个问题"
+            "（我会拆分成多个 issue）。\n"
+            f"描述完毕后发送「{START_WORD}」，我会整理信息并追问细节；发送「取消」退出。"
         )
 
         timeout = max(30, int(self.config.get("session_timeout", 300)))
@@ -261,18 +281,42 @@ class AutoIssuePlugin(Star):
             await self._publish(controller, event, state, confirm.group(2), timeout)
             return
 
-        force_draft = lowered in FORCE_DRAFT_WORDS
-        if force_draft:
-            self._save_mark(state)
-            state.transcript.append(
-                ("user", self._speaker(event), "（请根据已有信息直接生成 issue 草稿）")
-            )
-            self._record_images(state, event)
-        elif not self._record_message(state, event, text):
+        if not state.started:
+            await self._collect(controller, event, state, text, timeout)
             return
 
+        if not self._record_message(state, event, text):
+            return
         controller.keep(timeout=timeout, reset_timeout=True)
-        await self._advance(event, state, force_draft=force_draft)
+        await self._advance(event, state)
+
+    async def _collect(
+        self,
+        controller: SessionController,
+        event: AstrMessageEvent,
+        state: IssueSession,
+        text: str,
+        timeout: int,
+    ):
+        """收集阶段：只记录消息，直到发起人发送「生成」才交给 AI 整理。"""
+        if text != START_WORD:
+            if self._record_message(state, event, text):
+                controller.keep(timeout=timeout, reset_timeout=True)
+            return
+
+        if not self._can_operate(event, state):
+            await event.send(event.plain_result(f"只有发起人或管理员可以发送「{START_WORD}」开始整理。"))
+            return
+        # 「生成」消息里附带的图片也要记录
+        self._record_message(state, event, "")
+        if not any(role == "user" for role, _, _ in state.transcript):
+            await event.send(event.plain_result(f"还没有收到任何描述，请先描述问题后再发送「{START_WORD}」。"))
+            return
+
+        state.started = True
+        controller.keep(timeout=timeout, reset_timeout=True)
+        await event.send(event.plain_result("收到，正在整理…"))
+        await self._advance(event, state)
 
     async def _publish(
         self,
@@ -326,22 +370,38 @@ class AutoIssuePlugin(Star):
             controller.stop()
         await event.send(event.plain_result("\n".join(lines)))
 
-    async def _advance(
-        self, event: AstrMessageEvent, state: IssueSession, force_draft: bool = False
-    ):
+    async def _advance(self, event: AstrMessageEvent, state: IssueSession):
         """调用 LLM，决定继续追问还是生成草稿。"""
         max_rounds = int(self.config.get("max_rounds", 6))
-        must_draft = force_draft or state.ask_rounds >= max_rounds
+        must_draft = state.ask_rounds >= max_rounds
+        # 发送「生成」后的第一次整理，此时 AI 面对的是整段收集记录
+        first = state.ask_rounds == 0 and not state.drafts
 
         try:
-            result = await self._call_llm(event, state, must_draft)
+            await self._describe_images(event, state)
+            result = await self._call_llm(event, state, must_draft, first)
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] llm error: {e}", exc_info=True)
             await event.send(event.plain_result(f"AI 调用失败：{e}\n你可以重新发送消息再试一次。"))
             return
 
         action = result.get("action")
-        if action == "ignore" and not force_draft:
+        if action == "reject" and first:
+            # 收集到的内容整体无关：清空记录，回到收集阶段
+            message = str(result.get("message") or "").strip() or "这与项目开发无关，无法生成 issue。"
+            state.transcript.clear()
+            state.images.clear()
+            state.participants = {state.initiator_id: state.initiator_name}
+            state.mark = None
+            state.started = False
+            await event.send(
+                event.plain_result(
+                    f"{message}\n可以重新描述项目相关的问题，完成后发送「{START_WORD}」，或发送「取消」退出。"
+                )
+            )
+            return
+
+        if action == "ignore" and not first:
             self._rollback(state)
             return
 
@@ -373,12 +433,44 @@ class AutoIssuePlugin(Star):
 
     # ------------------------------------------------------------------ LLM
 
-    async def _call_llm(
-        self, event: AstrMessageEvent, state: IssueSession, must_draft: bool
-    ) -> dict:
-        provider_id = self.config.get("provider_id") or (
-            await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+    async def _provider_id(self, event: AstrMessageEvent, key: str = "provider_id") -> str:
+        return (
+            self.config.get(key)
+            or self.config.get("provider_id")
+            or await self.context.get_current_chat_provider_id(event.unified_msg_origin)
         )
+
+    async def _describe_images(self, event: AstrMessageEvent, state: IssueSession):
+        """用模型识别尚未识别的图片，提取其中的有用信息。"""
+        if not self.config.get("image_recognition", True):
+            return
+        pending = [img for img in state.images if img.description is None]
+        if not pending:
+            return
+        provider_id = await self._provider_id(event, "image_provider_id")
+        prompt = self.config.get("image_prompt", "").strip() or "请描述这张图片中与软件问题相关的信息。"
+
+        async def describe(img: ImageItem):
+            full_prompt = prompt
+            if img.context:
+                full_prompt += "\n\n" + IMAGE_CONTEXT_PROMPT.format(context=img.context)
+            try:
+                resp = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=full_prompt,
+                    image_urls=[img.url],
+                )
+                img.description = (resp.completion_text or "").strip() or "（未识别出内容）"
+            except Exception as e:
+                logger.warning(f"[{PLUGIN_NAME}] image recognition failed: {e}")
+                img.description = "（识别失败）"
+
+        await asyncio.gather(*(describe(img) for img in pending))
+
+    async def _call_llm(
+        self, event: AstrMessageEvent, state: IssueSession, must_draft: bool, first: bool
+    ) -> dict:
+        provider_id = await self._provider_id(event)
 
         labels = self._available_labels()
         labels_field = ', "labels": ["标签1"]' if labels else ""
@@ -396,11 +488,14 @@ class AutoIssuePlugin(Star):
             parts.append(f"# 项目背景\n{project_context}")
         parts.append(f"# 目标仓库\n{self._parse_repo(self.config.get('github_repo', ''))}")
         parts.append("# 群聊记录（按时间顺序）\n" + self._format_transcript(state))
-        if state.image_urls:
-            parts.append(
-                f"# 附件\n群友共发送了 {len(state.image_urls)} 张图片，"
+        if state.images:
+            lines = [
+                f"# 图片识别结果\n群友共发送了 {len(state.images)} 张图片，"
                 "发布时会按 images 字段自动附在对应 issue 末尾，正文中无需引用图片链接。"
-            )
+            ]
+            for i, img in enumerate(state.images, 1):
+                lines.append(f"- 图片 #{i}（{img.sender} 发送）：{img.description or '（未识别）'}")
+            parts.append("\n".join(lines))
         if state.drafts:
             drafts_json = json.dumps(
                 [
@@ -414,7 +509,13 @@ class AutoIssuePlugin(Star):
                 "草稿已经发给群友预览。如果最新消息是对草稿的修改意见、补充信息或新的问题，"
                 "请输出修改后的完整草稿列表（action=draft，包含所有仍需发布的 issue）。"
             )
-        if must_draft:
+        if first:
+            parts.append(
+                "# 要求\n以上是群友在收集阶段发送的全部内容，现在开始整理。"
+                "信息不足就追问（ask），信息充足就生成草稿（draft），"
+                "全部与项目无关则拒绝（reject），不要输出 ignore。"
+            )
+        elif must_draft:
             parts.append(
                 "# 要求\n不要再追问，请根据已有信息立即输出 action=draft 的 JSON；"
                 "如果没有任何与项目相关的内容，输出 action=reject。"
@@ -422,15 +523,10 @@ class AutoIssuePlugin(Star):
         else:
             parts.append(f"# 状态\n已追问 {state.ask_rounds} 轮。请根据最新消息决定下一步。")
 
-        image_urls = None
-        if self.config.get("send_images_to_llm", False) and state.image_urls:
-            image_urls = state.image_urls
-
         resp = await self.context.llm_generate(
             chat_provider_id=provider_id,
             system_prompt=system_prompt,
             prompt="\n\n".join(parts),
-            image_urls=image_urls,
         )
         return self._parse_llm_json(resp.completion_text or "")
 
@@ -472,7 +568,7 @@ class AutoIssuePlugin(Star):
                 images = [
                     int(i)
                     for i in images
-                    if str(i).isdigit() and 1 <= int(i) <= len(state.image_urls)
+                    if str(i).isdigit() and 1 <= int(i) <= len(state.images)
                 ]
             else:
                 images = None
@@ -628,9 +724,9 @@ class AutoIssuePlugin(Star):
 
         if self.config.get("include_images", True):
             if draft.images is None:
-                urls = state.image_urls
+                urls = [img.url for img in state.images]
             else:
-                urls = [state.image_urls[i - 1] for i in draft.images]
+                urls = [state.images[i - 1].url for i in draft.images]
             if urls:
                 images = "\n".join(f"![image{i}]({u})" for i, u in enumerate(urls, 1))
                 body += f"\n\n### 附件图片\n\n{images}"
@@ -670,8 +766,8 @@ class AutoIssuePlugin(Star):
     def _record_message(self, state: IssueSession, event: AstrMessageEvent, text: str) -> bool:
         """记录一条群友消息，返回是否包含有效内容。"""
         self._save_mark(state)
-        first_new = len(state.image_urls) + 1
-        new_images = self._record_images(state, event)
+        first_new = len(state.images) + 1
+        new_images = self._record_images(state, event, text)
         if not text and not new_images:
             return False
         content = text
@@ -684,7 +780,7 @@ class AutoIssuePlugin(Star):
 
     @staticmethod
     def _save_mark(state: IssueSession):
-        state.mark = (len(state.transcript), len(state.image_urls), dict(state.participants))
+        state.mark = (len(state.transcript), len(state.images), dict(state.participants))
 
     @staticmethod
     def _rollback(state: IssueSession):
@@ -693,16 +789,18 @@ class AutoIssuePlugin(Star):
             return
         transcript_len, image_len, participants = state.mark
         del state.transcript[transcript_len:]
-        del state.image_urls[image_len:]
+        del state.images[image_len:]
         state.participants = participants
         state.mark = None
 
-    def _record_images(self, state: IssueSession, event: AstrMessageEvent) -> int:
+    def _record_images(self, state: IssueSession, event: AstrMessageEvent, context: str) -> int:
+        known = {img.url for img in state.images}
         count = 0
         for comp in event.get_messages():
             url = self._image_url(comp)
-            if url and url not in state.image_urls:
-                state.image_urls.append(url)
+            if url and url not in known:
+                state.images.append(ImageItem(url, self._speaker(event), context))
+                known.add(url)
                 count += 1
         return count
 
@@ -737,7 +835,7 @@ class AutoIssuePlugin(Star):
             lines += ["", f"【{idx}】{d.title}" if multi else f"标题：{d.title}"]
             if d.labels:
                 lines.append(f"标签：{', '.join(d.labels)}")
-            image_count = len(state.image_urls) if d.images is None else len(d.images)
+            image_count = len(state.images) if d.images is None else len(d.images)
             if image_count and self.config.get("include_images", True):
                 lines.append(f"附件图片：{image_count} 张")
             lines += ["", d.body]
