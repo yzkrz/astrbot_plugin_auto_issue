@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hashlib
 import json
 import re
 import shutil
@@ -25,18 +27,30 @@ PLUGIN_NAME = "astrbot_plugin_auto_issue"
 
 CANCEL_WORDS = {"取消", "退出", "结束", "算了", "cancel", "quit", "exit"}
 START_WORD = "生成"
-CONFIRM_PATTERN = re.compile(r"(确认发布|确认|发布|提交|确定|ok|yes|y)\s*([\d\s,，、]*)")
+CONTINUE_WORD = "继续"
+CONFIRM_PATTERN = re.compile(r"(确认发布|确认|发布|提交|确定|生成|ok|yes|y)\s*([\d\s,，、]*)")
 COMMAND_PATTERN = re.compile(r"^\s*/?(issue|反馈)(?:\s+|$)", re.I)
 
 USAGE = (
     "用法：\n"
     "/issue 进入生成模式，之后的对话会被整理成 issue\n"
     "/issue list 列出所有 open 的 issue\n"
+    "/issue test 检查你的 Token 是否有该仓库的 issue 权限\n"
     "/issue <编号> 查看 issue 详情\n"
     "/issue <编号> <内容> 为 issue 添加评论"
 )
 
 NO_TOKEN_TIP = "你还没有绑定 GitHub Token，无法提交 issue 或评论，请联系管理员在插件配置页绑定。"
+
+# PicX 内置的图片链接规则
+PICX_LINK_RULES = {
+    "GitHub": "https://github.com/{owner}/{repo}/raw/{branch}/{path}",
+    "GitHub Pages": "https://{owner}.github.io/{repo}/{path}",
+    "jsDelivr": "https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{path}",
+    "Statically": "https://cdn.statically.io/gh/{owner}/{repo}@{branch}/{path}",
+    "ChinaJsDelivr": "https://jsd.cdn.zzko.cn/gh/{owner}/{repo}@{branch}/{path}",
+}
+IMAGE_MAX_BYTES = 20 * 1024 * 1024
 
 BODY_PREVIEW_LIMIT = 800
 COMMENT_PREVIEW_LIMIT = 200
@@ -49,9 +63,9 @@ OUTPUT_FORMAT_PROMPT = """
 {"action": "ask", "message": "发给群友的追问内容"}
 2. 信息已经充足，生成 issue 草稿：
 {"action": "draft", "issues": [{"title": "issue 标题", "body": "issue 正文（Markdown）"__LABELS_FIELD__, "images": [1, 2]}]}
-3. 最新的消息是群友之间的闲聊，并不是在向你反馈，不需要回应：
+3. 最新一批消息（你上次发言之后群友发送的所有消息）都是群友之间的闲聊，并不是在向你反馈，不需要回应：
 {"action": "ignore"}
-4. 最新的消息是在向你反馈，但内容与本项目的开发无关，拒绝生成 issue：
+4. 最新一批消息是在向你反馈，但内容与本项目的开发无关，拒绝生成 issue：
 {"action": "reject", "message": "简短友好地说明为什么不能生成 issue"}
 
 # 相关性规则
@@ -96,6 +110,8 @@ class ImageItem:
     context: str
     # 模型识别结果，None 表示尚未识别
     description: str | None = None
+    # 上传到 PicX 图床后的链接
+    hosted: str = ""
 
 
 @dataclass
@@ -142,12 +158,13 @@ class IssueSessionFilter(SessionFilter):
     PLUGIN_NAME,
     "YourName",
     "群聊需求转 GitHub Issue：AI 多轮追问补全细节，预览确认后发布",
-    "1.4.1",
+    "1.5.0",
 )
 class AutoIssuePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._picx_branch: str = ""
         self.image_dir: Path | None = None
         try:
             self.image_dir = StarTools.get_data_dir(PLUGIN_NAME) / "images"
@@ -187,6 +204,8 @@ class AutoIssuePlugin(Star):
         """解析查询类子指令，无法识别时返回 None。"""
         if args.lower() in {"list", "ls", "列表"}:
             return ("list",)
+        if args.lower() in {"test", "测试"}:
+            return ("test",)
         m = re.match(r"^#?(\d+)(?:\s+(.+))?$", args, re.S)
         if not m:
             return None
@@ -199,6 +218,8 @@ class AutoIssuePlugin(Star):
         if query[0] == "comment" and not self._token_for(sender, write=True):
             return NO_TOKEN_TIP
         try:
+            if query[0] == "test":
+                return await self._test_permission(sender)
             if query[0] == "list":
                 return await self._list_issues(self._token_for(sender))
             if query[0] == "detail":
@@ -301,7 +322,20 @@ class AutoIssuePlugin(Star):
             await self._collect(controller, event, state, text, timeout)
             return
 
-        if not self._record_message(state, event, text):
+        if text != CONTINUE_WORD:
+            if self._record_message(state, event, text):
+                controller.keep(timeout=timeout, reset_timeout=True)
+            return
+
+        if not self._can_operate(event, state):
+            await event.send(event.plain_result(f"只有发起人或管理员可以发送「{CONTINUE_WORD}」。"))
+            return
+        # 「继续」消息里附带的图片也要记录
+        self._record_message(state, event, "")
+        if state.mark is None or len(state.transcript) <= state.mark[0]:
+            await event.send(
+                event.plain_result(f"还没有新的回复，请先回答问题或提出修改意见后再发送「{CONTINUE_WORD}」。")
+            )
             return
         controller.keep(timeout=timeout, reset_timeout=True)
         await self._advance(event, state)
@@ -378,7 +412,9 @@ class AutoIssuePlugin(Star):
         if remaining:
             lines += ["", f"剩余 {len(remaining)} 个草稿："]
             lines += [f"【{i}】{d.title}" for i, d in enumerate(remaining, 1)]
-            lines.append("回复「确认」继续发布（或「确认 1 2」只发布部分），回复修改意见调整草稿，或「取消」放弃。")
+            lines.append(
+                f"回复「确认」继续发布（或「确认 1 2」只发布部分），回复修改意见后发送「{CONTINUE_WORD}」调整草稿，或「取消」放弃。"
+            )
             controller.keep(timeout=timeout, reset_timeout=True)
         else:
             lines.append("感谢反馈！")
@@ -398,8 +434,12 @@ class AutoIssuePlugin(Star):
             result = await self._call_llm(event, state, must_draft, first)
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] llm error: {e}", exc_info=True)
-            await event.send(event.plain_result(f"AI 调用失败：{e}\n你可以重新发送消息再试一次。"))
+            word = CONTINUE_WORD if state.started and not first else START_WORD
+            await event.send(event.plain_result(f"AI 调用失败：{e}\n可以稍后再次发送「{word}」重试。"))
             return
+        # 本批消息已交给 AI 处理，之后的消息开始新的一批
+        batch = state.mark
+        state.mark = None
 
         action = result.get("action")
         if action == "reject" and first:
@@ -419,16 +459,19 @@ class AutoIssuePlugin(Star):
             return
 
         if action == "ignore" and not first:
-            self._rollback(state)
+            self._rollback(state, batch)
+            await event.send(
+                event.plain_result(f"这些消息似乎与当前 issue 无关，请回答上面的问题后再发送「{CONTINUE_WORD}」。")
+            )
             return
 
         if action == "reject":
-            self._rollback(state)
+            self._rollback(state, batch)
             message = str(result.get("message") or "").strip() or "这与项目开发无关，无法生成 issue。"
             if state.drafts:
                 message += f"\n当前 {len(state.drafts)} 个草稿不受影响，可回复「确认」发布或继续修改。"
             else:
-                message += "\n如有项目相关的问题请继续描述，或发送「取消」退出。"
+                message += f"\n如有项目相关的问题请继续描述并发送「{CONTINUE_WORD}」，或发送「取消」退出。"
             await event.send(event.plain_result(message))
             return
 
@@ -446,7 +489,9 @@ class AutoIssuePlugin(Star):
             message = "能再详细描述一下吗？"
         state.ask_rounds += 1
         state.transcript.append(("assistant", "助手", message))
-        await event.send(event.plain_result(message))
+        await event.send(
+            event.plain_result(f"{message}\n\n（大家可以分多条回复，补充完后由发起人发送「{CONTINUE_WORD}」）")
+        )
 
     # ------------------------------------------------------------------ LLM
 
@@ -525,7 +570,7 @@ class AutoIssuePlugin(Star):
             )
             parts.append(
                 f"# 当前待发布的草稿\n{drafts_json}\n"
-                "草稿已经发给群友预览。如果最新消息是对草稿的修改意见、补充信息或新的问题，"
+                "草稿已经发给群友预览。如果最新一批消息是对草稿的修改意见、补充信息或新的问题，"
                 "请输出修改后的完整草稿列表（action=draft，包含所有仍需发布的 issue）。"
             )
         if first:
@@ -540,7 +585,10 @@ class AutoIssuePlugin(Star):
                 "如果没有任何与项目相关的内容，输出 action=reject。"
             )
         else:
-            parts.append(f"# 状态\n已追问 {state.ask_rounds} 轮。请根据最新消息决定下一步。")
+            parts.append(
+                f"# 状态\n已追问 {state.ask_rounds} 轮。你上次发言之后，群友可能发送了多条消息"
+                "（可能来自不同成员），请综合这些消息决定下一步。"
+            )
 
         resp = await self.context.llm_generate(
             chat_provider_id=provider_id,
@@ -603,9 +651,13 @@ class AutoIssuePlugin(Star):
         token: str,
         payload: dict | None = None,
         params: dict | None = None,
+        repo: str | None = None,
+        absolute: bool = False,
     ) -> tuple[int, Any]:
-        repo = self._parse_repo(self.config.get("github_repo", ""))
+        """调用 GitHub API。absolute 为 True 时 path 不加 /repos/{repo} 前缀。"""
+        repo = repo or self._parse_repo(self.config.get("github_repo", ""))
         api_base = (self.config.get("github_api_base") or "https://api.github.com").rstrip("/")
+        url = f"{api_base}{path}" if absolute else f"{api_base}/repos/{repo}{path}"
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
@@ -616,24 +668,34 @@ class AutoIssuePlugin(Star):
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.request(
                 method,
-                f"{api_base}/repos/{repo}{path}",
+                url,
                 json=payload,
                 params=params,
                 headers=headers,
             ) as resp:
-                return resp.status, await resp.json(content_type=None)
+                data = await resp.json(content_type=None)
+                if isinstance(data, dict):
+                    # classic token 会在响应头中返回权限范围，fine-grained token 没有该响应头
+                    data["_scopes"] = resp.headers.get("X-OAuth-Scopes")
+                return resp.status, data
 
     @staticmethod
     def _api_error(status: int, data) -> RuntimeError:
         if status == 401:
             return RuntimeError("GitHub Token 无效或已过期，请联系管理员更新")
+        scopes = data.get("_scopes") if isinstance(data, dict) else None
+        scope_tip = ""
+        if scopes is not None and "repo" not in {x.strip() for x in scopes.split(",")}:
+            scope_tip = f"（当前 classic token 的权限为「{scopes or '无'}」，访问私有仓库需要勾选 repo）"
         if status == 404:
-            return RuntimeError("未找到（请检查 issue 编号、仓库地址及 Token 权限）")
+            return RuntimeError(
+                "未找到：请检查 issue 编号、仓库地址，以及 Token 所属账号是否为仓库协作者" + scope_tip
+            )
         message = data.get("message") if isinstance(data, dict) else data
-        return RuntimeError(f"GitHub API 返回 {status}：{message}")
+        return RuntimeError(f"GitHub API 返回 {status}：{message}{scope_tip}")
 
     async def _create_issue(self, state: IssueSession, draft: IssueDraft) -> str:
-        payload: dict = {"title": draft.title, "body": self._build_body(state, draft)}
+        payload: dict = {"title": draft.title, "body": await self._build_body(state, draft)}
         if draft.labels:
             payload["labels"] = draft.labels
 
@@ -650,6 +712,88 @@ class AutoIssuePlugin(Star):
         if status != 201:
             raise self._api_error(status, data)
         return data.get("html_url", "")
+
+    async def _test_permission(self, user_id: str) -> str:
+        repo = self._parse_repo(self.config.get("github_repo", ""))
+        bound = self._bound_token(user_id)
+        token = self._token_for(user_id, write=True)
+        lines = [f"🔍 仓库 {repo} 权限检查"]
+        if bound:
+            lines.append("Token：使用你绑定的 Token")
+        elif token:
+            lines.append("Token：你未绑定 Token，使用默认 Token（issue 将以默认 Token 的账号创建）")
+        else:
+            lines.append("❌ 你未绑定 Token，且已关闭「未绑定的用户使用默认 Token 提交」，无法提交 issue")
+            return "\n".join(lines)
+
+        status, user = await self._github("GET", "/user", token, absolute=True)
+        if status == 401:
+            lines.append("❌ Token 无效或已过期")
+            return "\n".join(lines)
+        if status != 200:
+            lines.append(f"❌ 获取账号信息失败：{self._api_error(status, user)}")
+            return "\n".join(lines)
+
+        scopes_raw = user.get("_scopes")
+        classic = scopes_raw is not None
+        scopes = {x.strip() for x in (scopes_raw or "").split(",") if x.strip()}
+        if classic:
+            kind = f"classic token（权限：{', '.join(sorted(scopes)) or '无'}）"
+        elif token.startswith("github_pat_"):
+            kind = "fine-grained token"
+        else:
+            kind = "未知类型 token"
+        lines.append(f"GitHub 账号：{user.get('login')} | {kind}")
+
+        status, info = await self._github("GET", "", token)
+        if status != 200:
+            reason = "仓库不存在，或该账号不是仓库协作者"
+            if classic and "repo" not in scopes:
+                reason += "（访问私有仓库需要勾选 repo 权限）"
+            elif not classic:
+                reason += "（fine-grained token 无法访问他人个人账号下的仓库，协作者请改用 classic token）"
+            lines.append(f"❌ 无法访问仓库：{reason}")
+            return "\n".join(lines)
+
+        private = bool(info.get("private"))
+        perms = info.get("permissions") or {}
+        role = next(
+            (name for key, name in (("admin", "管理员"), ("maintain", "维护者"), ("push", "可写"),
+                                    ("triage", "分类"), ("pull", "只读")) if perms.get(key)),
+            "无",
+        )
+        lines.append(f"仓库：{'私有' if private else '公开'} | 你的角色：{role}")
+
+        scope_ok = True
+        if classic:
+            needed = {"repo"} if private else {"repo", "public_repo"}
+            scope_ok = bool(scopes & needed)
+        can_issue = info.get("has_issues", True) and not info.get("archived") and scope_ok
+
+        def mark(ok: bool) -> str:
+            return "✅" if ok else "❌"
+
+        lines.append(f"{mark(can_issue)} 创建 issue / 评论")
+        lines.append(f"{mark(bool(perms.get('pull')))} 查看 issue")
+        lines.append(f"{mark(can_issue and bool(perms.get('push')))} 创建时打标签（需要可写权限，否则标签会被忽略）")
+        if not info.get("has_issues", True):
+            lines.append("⚠️ 仓库未开启 Issues 功能")
+        if info.get("archived"):
+            lines.append("⚠️ 仓库已归档，不能新建 issue")
+        if classic and not scope_ok:
+            lines.append(f"⚠️ classic token 需要勾选 {'repo' if private else 'repo 或 public_repo'} 权限")
+        if not classic:
+            lines.append("⚠️ fine-grained token 无法预先检查 Issues 写权限，请确认已授予 Issues: Read and write")
+
+        picx_repo = self._picx_repo()
+        if picx_repo and self.config.get("include_images", True):
+            p_status, p_info = await self._github("GET", "", self._picx_token(), repo=picx_repo)
+            p_ok = p_status == 200 and bool((p_info.get("permissions") or {}).get("push"))
+            visibility = ""
+            if p_status == 200:
+                visibility = "私有" if p_info.get("private") else "公开"
+            lines.append(f"{mark(p_ok)} 图床 {picx_repo} {visibility}可写（使用图床 Token，与你的 Token 无关）")
+        return "\n".join(lines)
 
     async def _list_issues(self, token: str) -> str:
         limit = max(1, int(self.config.get("list_limit", 50)))
@@ -720,7 +864,12 @@ class AutoIssuePlugin(Star):
     async def _add_comment(self, event: AstrMessageEvent, number: int, text: str) -> str:
         body = text
         if self.config.get("include_images", True):
-            urls = [url for url, _ in self._extract_images(event) if url]
+            urls = []
+            for url, local in self._extract_images(event):
+                img = ImageItem(url, local, self._speaker(event), "")
+                link = await self._image_link(img)
+                if link:
+                    urls.append(link)
             if urls:
                 body += "\n\n" + "\n".join(f"![image{i}]({u})" for i, u in enumerate(urls, 1))
         if self.config.get("append_submitter_info", True):
@@ -738,14 +887,111 @@ class AutoIssuePlugin(Star):
             raise self._api_error(status, data)
         return f"已评论 #{number}：{data.get('html_url', '')}"
 
-    def _build_body(self, state: IssueSession, draft: IssueDraft) -> str:
+    # ------------------------------------------------------------------ PicX 图床
+
+    def _picx_repo(self) -> str:
+        return self._parse_repo(self.config.get("picx_repo", ""))
+
+    def _picx_token(self) -> str:
+        return str(self.config.get("picx_token") or self.config.get("github_token") or "").strip()
+
+    async def _image_link(self, img: ImageItem) -> str:
+        """返回图片在 issue 中使用的链接：优先上传到 PicX 图床，失败时退回原始链接。"""
+        if not self._picx_repo():
+            return img.url
+        if img.hosted:
+            return img.hosted
+        try:
+            data = await self._read_image(img)
+            if data:
+                img.hosted = await self._upload_to_picx(data)
+                return img.hosted
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 上传图片到图床失败，改用原始链接：{e}")
+        return img.url
+
+    async def _read_image(self, img: ImageItem) -> bytes:
+        if img.local_path and Path(img.local_path).is_file():
+            return Path(img.local_path).read_bytes()
+        if not img.url:
+            return b""
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.get(img.url) as resp:
+                resp.raise_for_status()
+                data = await resp.content.read(IMAGE_MAX_BYTES + 1)
+        if len(data) > IMAGE_MAX_BYTES:
+            raise RuntimeError("图片过大")
+        return data
+
+    async def _upload_to_picx(self, data: bytes) -> str:
+        repo = self._picx_repo()
+        token = self._picx_token()
+        if not token:
+            raise RuntimeError("未配置图床 Token")
+
+        if not self._picx_branch:
+            self._picx_branch = str(self.config.get("picx_branch", "")).strip()
+        if not self._picx_branch:
+            status, info = await self._github("GET", "", token, repo=repo)
+            if status != 200:
+                raise self._api_error(status, info)
+            self._picx_branch = info.get("default_branch") or "master"
+
+        # 按月份分目录，以内容的 SHA-256 命名，同一个月内相同图片只上传一次
+        name = f"{hashlib.sha256(data).hexdigest()}.{self._image_ext(data)}"
+        directory = str(self.config.get("picx_dir", "")).strip().strip("/")
+        month = time.strftime("%Y%m")
+        path = f"{directory}/{month}/{name}" if directory else f"{month}/{name}"
+        status, resp = await self._github(
+            "PUT",
+            f"/contents/{path}",
+            token,
+            {
+                "message": f"Upload image via {PLUGIN_NAME}",
+                "content": base64.b64encode(data).decode(),
+                "branch": self._picx_branch,
+            },
+            repo=repo,
+        )
+        # 422 表示同名文件已存在，内容相同，直接使用
+        if status not in (200, 201, 422):
+            raise self._api_error(status, resp)
+
+        owner, repo_name = repo.split("/")
+        link_type = self.config.get("picx_link_type", "GitHub")
+        rule = PICX_LINK_RULES.get(link_type) or str(self.config.get("picx_custom_rule", "")).strip()
+        if not rule:
+            rule = PICX_LINK_RULES["GitHub"]
+        # 兼容 PicX 的 {{owner}} 写法
+        rule = re.sub(r"\{\{(\w+)\}\}", r"{\1}", rule)
+        return (
+            rule.replace("{owner}", owner)
+            .replace("{repo}", repo_name)
+            .replace("{branch}", self._picx_branch)
+            .replace("{path}", path)
+        )
+
+    @staticmethod
+    def _image_ext(data: bytes) -> str:
+        if data.startswith(b"\x89PNG"):
+            return "png"
+        if data.startswith(b"\xff\xd8"):
+            return "jpg"
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return "gif"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "webp"
+        if data[:2] == b"BM":
+            return "bmp"
+        return "png"
+
+    async def _build_body(self, state: IssueSession, draft: IssueDraft) -> str:
         body = draft.body
 
         if self.config.get("include_images", True):
-            if draft.images is None:
-                urls = [img.url for img in state.images]
-            else:
-                urls = [state.images[i - 1].url for i in draft.images]
+            picked = state.images if draft.images is None else [state.images[i - 1] for i in draft.images]
+            urls = [await self._image_link(img) for img in picked]
             urls = [u for u in urls if u]
             if urls:
                 images = "\n".join(f"![image{i}]({u})" for i, u in enumerate(urls, 1))
@@ -785,7 +1031,8 @@ class AutoIssuePlugin(Star):
 
     def _record_message(self, state: IssueSession, event: AstrMessageEvent, text: str) -> bool:
         """记录一条群友消息，返回是否包含有效内容。"""
-        self._save_mark(state)
+        if state.mark is None:
+            self._save_mark(state)
         first_new = len(state.images) + 1
         new_images = self._record_images(state, event, text)
         if not text and not new_images:
@@ -802,12 +1049,11 @@ class AutoIssuePlugin(Star):
     def _save_mark(state: IssueSession):
         state.mark = (len(state.transcript), len(state.images), dict(state.participants))
 
-    @staticmethod
-    def _rollback(state: IssueSession):
-        """撤销最近一条被判定为无关的消息，避免混入 issue 和参与者名单。"""
-        if state.mark is None:
+    def _rollback(self, state: IssueSession, mark: tuple[int, int, dict[str, str]] | None):
+        """撤销被判定为无关的一批消息，避免混入 issue 和参与者名单。"""
+        if mark is None:
             return
-        transcript_len, image_len, participants = state.mark
+        transcript_len, image_len, participants = mark
         del state.transcript[transcript_len:]
         self._discard_images(state.images[image_len:])
         del state.images[image_len:]
@@ -914,15 +1160,16 @@ class AutoIssuePlugin(Star):
             if d.labels:
                 lines.append(f"标签：{', '.join(d.labels)}")
             picked = state.images if d.images is None else [state.images[i - 1] for i in d.images]
-            image_count = sum(1 for img in picked if img.url)
+            image_count = sum(1 for img in picked if img.url or (self._picx_repo() and img.local_path))
             if image_count and self.config.get("include_images", True):
                 lines.append(f"附件图片：{image_count} 张")
             lines += ["", d.body]
         lines += ["", "———"]
         if multi:
-            lines.append("回复「确认」全部发布，「确认 1 3」只发布指定编号，「取消」放弃，或直接回复修改意见。")
+            lines.append("回复「确认」全部发布，「确认 1 3」只发布指定编号，「取消」放弃。")
         else:
-            lines.append("回复「确认」发布，「取消」放弃，或直接回复修改意见。")
+            lines.append("回复「确认」发布，「取消」放弃。")
+        lines.append(f"需要修改时直接回复修改意见，然后由发起人发送「{CONTINUE_WORD}」。")
         return "\n".join(lines)
 
     def _available_labels(self) -> list[str]:
@@ -943,11 +1190,7 @@ class AutoIssuePlugin(Star):
             return "插件尚未配置 GitHub 仓库或 Token，请联系管理员在插件配置页填写。"
         return None
 
-    def _token_for(self, user_id: str, write: bool = False) -> str:
-        """获取用户使用的 Token：优先使用绑定的 Token，否则使用默认 Token。
-
-        write 为 True 且关闭了「未绑定用户使用默认 Token」时，未绑定用户返回空字符串。
-        """
+    def _bound_token(self, user_id: str) -> str:
         for item in self.config.get("user_tokens", []) or []:
             if not isinstance(item, dict):
                 continue
@@ -955,6 +1198,16 @@ class AutoIssuePlugin(Star):
                 token = str(item.get("token", "")).strip()
                 if token:
                     return token
+        return ""
+
+    def _token_for(self, user_id: str, write: bool = False) -> str:
+        """获取用户使用的 Token：优先使用绑定的 Token，否则使用默认 Token。
+
+        write 为 True 且关闭了「未绑定用户使用默认 Token」时，未绑定用户返回空字符串。
+        """
+        bound = self._bound_token(user_id)
+        if bound:
+            return bound
         if write and not self.config.get("fallback_to_default_token", True):
             return ""
         return str(self.config.get("github_token", "")).strip()

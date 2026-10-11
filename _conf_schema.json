@@ -11,7 +11,7 @@
     "type": "string",
     "default": "",
     "secret": true,
-    "hint": "用于查询 issue，以及未在「用户 Token 绑定」中绑定的用户提交 issue / 评论。推荐使用 Fine-grained token，只授予目标仓库的 Issues: Read and write 权限",
+    "hint": "用于查询 issue，以及未在「用户 Token 绑定」中绑定的用户提交 issue / 评论。支持 classic token 和 Fine-grained token。私有仓库使用 classic token 时需勾选 repo 权限；仓库协作者（非仓库所有者）只能使用 classic token，Fine-grained token 无法访问他人个人账号下的仓库",
     "obvious_hint": true
   },
   "user_tokens": {
@@ -41,7 +41,7 @@
             "type": "string",
             "default": "",
             "secret": true,
-            "hint": "需要目标仓库的 Issues: Read and write 权限"
+            "hint": "classic token 需勾选 repo 权限（协作者必须使用 classic token）；Fine-grained token 需目标仓库的 Issues: Read and write 权限"
           }
         }
       }
@@ -115,7 +115,12 @@
   "available_labels": {
     "description": "可用标签",
     "type": "list",
-    "default": ["bug", "enhancement", "question", "documentation"],
+    "default": [
+      "bug",
+      "enhancement",
+      "question",
+      "documentation"
+    ],
     "hint": "AI 只会从这些标签中选择，请确保标签在仓库中已存在"
   },
   "append_submitter_info": {
@@ -129,6 +134,51 @@
     "type": "bool",
     "default": true,
     "hint": "直接引用聊天平台提供的图片 URL，部分平台的图片链接可能会过期"
+  },
+  "picx_repo": {
+    "description": "PicX 图床仓库",
+    "type": "string",
+    "default": "",
+    "hint": "填写后，issue 中的图片会上传到该仓库再引用，避免聊天平台的图片链接过期。格式 owner/repo，如 yourname/picx-ih。留空则直接引用聊天平台的原始链接"
+  },
+  "picx_token": {
+    "description": "图床 Token",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "需要对图床仓库有写权限（classic token 勾选 repo，公开仓库勾选 public_repo 即可）。留空则使用默认 GitHub Token。图片统一用这个 Token 上传，与提交者无关"
+  },
+  "picx_branch": {
+    "description": "图床分支",
+    "type": "string",
+    "default": "",
+    "hint": "留空则使用仓库默认分支（PicX 创建的仓库为 master）"
+  },
+  "picx_dir": {
+    "description": "图床目录",
+    "type": "string",
+    "default": "auto-issue",
+    "hint": "图片存放的目录，支持多级如 a/b，留空则放在仓库根目录。目录下按上传月份分文件夹（如 202610），文件名为图片内容的 SHA-256，同一个月内相同图片只会上传一次"
+  },
+  "picx_link_type": {
+    "description": "图片链接规则",
+    "type": "string",
+    "default": "GitHub",
+    "options": [
+      "GitHub",
+      "jsDelivr",
+      "Statically",
+      "ChinaJsDelivr",
+      "GitHub Pages",
+      "自定义"
+    ],
+    "hint": "与 PicX 的链接规则一致。私有图床仓库只能用 GitHub（仅有权限的人可见）；CDN 需要图床仓库公开；GitHub Pages 需在仓库开启 Pages"
+  },
+  "picx_custom_rule": {
+    "description": "自定义链接规则",
+    "type": "string",
+    "default": "",
+    "hint": "链接规则选「自定义」时使用，可用 {{owner}} {{repo}} {{branch}} {{path}} 占位符，例如 https://img.example.com/{{path}}"
   },
   "image_recognition": {
     "description": "识别图片内容",
