@@ -78,6 +78,25 @@
     "default": "",
     "hint": "简单介绍项目是做什么的、有哪些模块、常见问题等，帮助 AI 提出更有针对性的问题"
   },
+  "content_review": {
+    "description": "发布前独立审核草稿",
+    "type": "bool",
+    "default": true,
+    "hint": "每次生成草稿后，再用一次独立的 AI 调用审核内容，拦截针对个人的侮辱、恶搞标语、隐私、广告等违规草稿。即使整理用的 AI 被群友诱导，违规草稿也无法发出。每次出草稿会多一次模型调用"
+  },
+  "review_provider_id": {
+    "description": "审核模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空则使用「使用的大模型」。建议选一个更强、更守规矩的模型"
+  },
+  "extra_reject_rules": {
+    "description": "补充拒绝规则",
+    "type": "text",
+    "default": "",
+    "hint": "每行一条，会同时加入整理和审核的提示词。例如：不接受修改项目名称和 Logo 的需求"
+  },
   "max_rounds": {
     "description": "最大追问轮数",
     "type": "int",
