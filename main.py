@@ -1836,7 +1836,7 @@ class AutoIssuePlugin(Star):
                     f"至 {time.strftime('%Y-%m-%d %H:%M', time.localtime(until))} 解除。再次违规将加重处罚。"
                 )
                 to_end.append(uid)
-            chain += [Comp.At(qq=uid, name=name), Comp.Plain(text + "\n")]
+            chain += [Comp.At(qq=uid, name=name), Comp.Plain(text)]
         self._save_strikes()
 
         await event.send(event.chain_result(chain))
