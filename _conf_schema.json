@@ -97,6 +97,28 @@
     "default": "",
     "hint": "每行一条，会同时加入整理和审核的提示词。例如：不接受修改项目名称和 Logo 的需求"
   },
+  "related_check": {
+    "description": "出草稿后检查已有 issue",
+    "type": "bool",
+    "default": true,
+    "hint": "生成草稿后，用 AI 比对仓库中已有 issue，列出可能重复或相关的，供群友选择新建、评论还是放弃。每次出草稿会多一次模型调用"
+  },
+  "related_scope": {
+    "description": "检查范围",
+    "type": "string",
+    "default": "open",
+    "options": [
+      "open",
+      "all"
+    ],
+    "hint": "open 只比对未关闭的 issue；all 同时比对已关闭的（适合经常关闭重复 issue 的仓库）"
+  },
+  "related_scan_limit": {
+    "description": "最多比对多少条 issue",
+    "type": "int",
+    "default": 100,
+    "hint": "按最近更新排序取前 N 条参与比对"
+  },
   "max_rounds": {
     "description": "最大追问轮数",
     "type": "int",
