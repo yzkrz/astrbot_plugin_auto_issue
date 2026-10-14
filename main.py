@@ -7,6 +7,7 @@ import re
 import shutil
 import time
 import uuid
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,7 @@ USAGE = (
     "/issue test 检查你的 Token 是否有该仓库的 issue 权限\n"
     "/issue <编号> 查看 issue 详情\n"
     "/issue <编号> <内容> 为 issue 添加评论\n"
-    "/issue ban @用户 <分钟> 禁止该用户使用 issue 功能，0 为解封（仅管理员）\n"
+    "/issue ban @用户 <时长> 禁止该用户使用 issue 功能，如 30m、3小时、两个半小时，0 为解封（仅管理员）\n"
     "/issue ban @用户 clear 清空该用户的违规记录，不影响封禁（仅管理员）\n"
     "/issue ban 查看封禁列表（仅管理员）"
 )
@@ -57,6 +58,150 @@ PICX_LINK_RULES = {
     "ChinaJsDelivr": "https://jsd.cdn.zzko.cn/gh/{owner}/{repo}@{branch}/{path}",
 }
 IMAGE_MAX_BYTES = 20 * 1024 * 1024
+
+# 时长解析：数字单位对，如 1h30m、三天、两个半小时、半小时、1.5 天
+CN_DIGITS = {
+    "零": 0, "〇": 0, "一": 1, "壹": 1, "幺": 1, "二": 2, "两": 2, "俩": 2, "贰": 2,
+    "三": 3, "叁": 3, "仨": 3, "四": 4, "肆": 4, "五": 5, "伍": 5, "六": 6, "陆": 6,
+    "七": 7, "柒": 7, "八": 8, "捌": 8, "九": 9, "玖": 9,
+}
+CN_UNITS = {"十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000}
+WORD_NUMBERS = {"半": 0.5, "俩": 2, "仨": 3, "一": 1}
+# 单位别名 -> 分钟数
+DURATION_UNITS = {
+    "秒": 1 / 60, "秒钟": 1 / 60, "s": 1 / 60, "sec": 1 / 60, "secs": 1 / 60,
+    "second": 1 / 60, "seconds": 1 / 60,
+    "分": 1, "分钟": 1, "m": 1, "min": 1, "mins": 1, "minute": 1, "minutes": 1,
+    "h": 60, "hr": 60, "hrs": 60, "hour": 60, "hours": 60,
+    "时": 60, "小时": 60, "个小时": 60, "钟头": 60,
+    "d": 1440, "day": 1440, "days": 1440, "天": 1440, "日": 1440, "号": 1440,
+    "w": 10080, "周": 10080, "星期": 10080, "礼拜": 10080, "个星期": 10080, "个礼拜": 10080,
+    "月": 43200, "个月": 43200, "月个": 43200,
+    "mo": 43200, "mon": 43200, "month": 43200, "months": 43200,
+    "y": 525600, "yr": 525600, "year": 525600, "years": 525600,
+    "年": 525600, "个年": 525600,
+}
+# 数字：阿拉伯数字、中文数字、半 / 俩 / 仨
+NUM_TOKEN = re.compile(r"\d+(?:\.\d+)?|[" + "".join(CN_DIGITS) + "".join(CN_UNITS) + r"]+|半|俩|仨")
+# 单位：英文缩写，或汉字（「个小时」「星期」等可能不止一个字）
+UNIT_TOKEN = re.compile(r"[a-zA-Z]+|[一-龥]+")
+# 时长前后可以忽略的填充字，如「请封他三个小时」「5分钟吧」
+FILLER_CHARS = "的了吧啊呀呢哦嗯请帮我给他她着您禁封号射，,。：:；;！!？?、 "
+NOISE_WORDS = ("の", "　")
+# 纯数字超过这个长度就不当成时长，防止 13 位时间戳被误读
+MAX_NUM_CHARS = 6
+
+
+def parse_duration(text: str) -> float | None:
+    """把「1h30m」「三天」「两个半小时」「半小时」「1.5 天」解析为分钟数，无法解析时返回 None。"""
+    text = (text or "").strip().lower()
+    for noise in NOISE_WORDS:
+        text = text.replace(noise, " ")
+    text = text.strip(FILLER_CHARS)
+    if not text:
+        return None
+
+    total = 0.0
+    pos = 0
+    matched = False
+    while pos < len(text):
+        if text[pos] in " ,，、+和又零":
+            pos += 1
+            continue
+        m = NUM_TOKEN.match(text, pos)
+        if not m:
+            return None
+        num_text = m.group(0)
+        if num_text.isascii() and len(num_text.split(".")[0]) > MAX_NUM_CHARS:
+            return None
+        value = _text_to_number(num_text)
+        if value is None:
+            return None
+        pos = m.end()
+        # 跳过空格和量词「个」（三个小时、3 个 小时）
+        while pos < len(text) and (text[pos] == " " or text.startswith("个", pos)):
+            pos += 1
+
+        unit = ""
+        m_unit = UNIT_TOKEN.match(text, pos)
+        if m_unit:
+            word = m_unit.group(0)
+            if word.isascii():
+                unit = word
+            else:
+                # 汉字串里取最长的已知单位前缀，剩下的继续解析（如「小时半」「天6」）
+                unit = next((word[:n] for n in range(len(word), 0, -1) if word[:n] in DURATION_UNITS), "")
+            pos += len(unit)
+        if unit and unit not in DURATION_UNITS:
+            return None
+        factor = DURATION_UNITS.get(unit, 1)
+
+        # 「两个半小时」：数字后的「半」属于同一个单位
+        if text.startswith("半", pos) and not unit:
+            pos += 1
+            value += 0.5
+            m_unit = UNIT_TOKEN.match(text, pos)
+            if text.startswith("个", pos):
+                pos += 1
+                m_unit = UNIT_TOKEN.match(text, pos)
+            if m_unit:
+                word = m_unit.group(0)
+                unit = word if word.isascii() else next(
+                    (word[:n] for n in range(len(word), 0, -1) if word[:n] in DURATION_UNITS), ""
+                )
+                if unit not in DURATION_UNITS:
+                    return None
+                pos += len(unit)
+                factor = DURATION_UNITS[unit]
+        # 「一个半小时」写成「1小时半」时，末尾的「半」表示半个该单位
+        elif unit and text.startswith("半", pos):
+            pos += 1
+            value += 0.5
+
+        total += value * factor
+        matched = True
+        # 剩余部分只剩填充字时结束
+        if not text[pos:].strip(FILLER_CHARS):
+            break
+
+    return round(total, 3) if matched else None
+
+
+def _text_to_number(text: str) -> float | None:
+    """把「三」「十五」「一百二」「俩」「半」等转成数字。"""
+    if text in WORD_NUMBERS:
+        return float(WORD_NUMBERS[text])
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        try:
+            return float(Decimal(text))
+        except InvalidOperation:
+            return None
+
+    if text and all(c in CN_DIGITS for c in text):
+        # 只有数字：按十进制拼接（一二三 -> 123）
+        return float("".join(str(CN_DIGITS[c]) for c in text))
+
+    # 含单位的中文数字：按 节值 + 待处理数字 累加
+    # 例：十五 -> 15，二十三 -> 23，一百二十 -> 120，三千 -> 3000
+    section = 0.0
+    number = 0.0
+    for ch in text:
+        if ch in CN_DIGITS:
+            number = CN_DIGITS[ch]
+        elif ch in {"万", "萬"}:
+            section = (section + number or 1) * 10000
+            number = 0
+        elif ch == "亿":
+            section = (section + number or 1) * 100000000
+            number = 0
+        elif ch in CN_UNITS:
+            # 「十五」「十六」这类省略了前面的「一」
+            section += (number or 1) * CN_UNITS[ch]
+            number = 0
+        else:
+            return None
+    return float(section + number)
+
 
 BODY_PREVIEW_LIMIT = 800
 COMMENT_PREVIEW_LIMIT = 200
@@ -237,7 +382,7 @@ class IssueSessionFilter(SessionFilter):
     PLUGIN_NAME,
     "YourName",
     "群聊需求转 GitHub Issue：AI 多轮追问补全细节，预览确认后发布",
-    "1.6.1",
+    "1.6.2",
 )
 class AutoIssuePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -1685,42 +1830,51 @@ class AutoIssuePlugin(Star):
         rest = re.sub(r"@[^@]*?\((\d+)\)", " ", args)
         tokens = rest.split()
         usage = (
-            "用法：/issue ban @用户 <分钟>，分钟为 0 表示解封；/issue ban @用户 clear 清空违规记录。"
-            "也可以用用户 ID 代替 @用户"
+            "用法：/issue ban @用户 <时长>，如 30、30m、3小时、两个半小时、1天6小时、1.5d；"
+            "0 表示解封，clear 清空违规记录。也可以用用户 ID 代替 @用户"
         )
         if not target_id:
-            # 没有 @ 时支持直接填用户 ID：ban <用户ID> <分钟|clear>
-            if len(tokens) != 2 or not tokens[0].isdigit():
+            # 没有 @ 时支持直接填用户 ID：ban <用户ID> <时长|clear>
+            if len(tokens) < 2 or not tokens[0].isdigit():
                 return usage
             target_id = tokens.pop(0)
-        if len(tokens) != 1 or not re.fullmatch(r"\d+|clear|清空", tokens[0], re.I):
-            return "请填写封禁分钟数（大于等于 0 的整数，0 表示解封）或 clear，例如：/issue ban @张三 30"
+        arg = " ".join(tokens).strip()
+        if not arg:
+            return usage
         label = f"{target_name}（{target_id}）" if target_name else target_id
 
-        if tokens[0].lower() in {"clear", "清空"}:
+        if arg.lower() in {"clear", "清空"}:
             strikes = self.strikes.pop(target_id, None)
             self._save_strikes()
             if not strikes:
                 return f"{label} 没有违规记录。"
             ban = self.bans.get(target_id)
-            tip = "（封禁状态不变）" if ban and ban["until"] > time.time() else ""
+            tip = "（目前仍属于封禁状态）" if ban and ban["until"] > time.time() else ""
             return f"已清空 {label} 的 {strikes['count']} 次违规记录{tip}。"
 
+        minutes = self._parse_ban_minutes(arg)
+        if minutes is None:
+            return (
+                "无法识别时长，请使用数字加单位，如 30、30m、3小时、两个半小时、1天6小时、1.5d；"
+                "0 表示解封，clear 清空违规记录"
+            )
         if target_id == str(event.get_sender_id()):
             return "不能封禁自己。"
 
-        minutes = int(tokens[0])
         if minutes == 0:
             existed = self.bans.pop(target_id, None)
             self._save_bans()
             if existed and existed["until"] > time.time():
                 count = self.strikes.get(target_id, {}).get("count", 0)
-                tip = f"（违规记录 {count} 次保留，如需清空请使用 clear）" if count else ""
+                tip = f"（违规记录 {count} 次）" if count else ""
                 return f"已解除 {label} 的封禁{tip}。"
             return f"{label} 当前没有被封禁。"
 
         until = self._apply_ban(
-            target_id, target_name, minutes, f"{event.get_sender_name()}（{event.get_sender_id()}）"
+            target_id,
+            target_name,
+            minutes,
+            f"{event.get_sender_name()}（{event.get_sender_id()}）",
         )
         ended = self._end_sessions_of(target_id)
         msg = (
@@ -1896,6 +2050,17 @@ class AutoIssuePlugin(Star):
         self._save_bans()
         return until
 
+    def _parse_ban_minutes(self, arg: str) -> int | None:
+        """解析封禁时长，返回分钟数（整数，向上取整），无法识别或为负时返回 None。"""
+        arg = arg.strip()
+        if re.fullmatch(r"\d+", arg):
+            return int(arg)
+        minutes = parse_duration(arg)
+        if minutes is None or minutes < 0:
+            return None
+        # 小于 1 分钟按 1 分钟处理，避免出现 0 分钟被当成解封
+        return max(1, math.ceil(minutes))
+
     def _end_sessions_of(self, user_id: str) -> int:
         """结束该用户发起的所有进行中会话，返回结束的数量。"""
         ended = 0
@@ -1919,7 +2084,7 @@ class AutoIssuePlugin(Star):
             lines.append("🚫 封禁列表：")
             for uid, b in active:
                 label = f"{b['name']}（{uid}）" if b.get("name") else uid
-                remaining = self._format_minutes(math.ceil((b["until"] - now) / 60))
+                remaining = self._format_minutes((b["until"] - now) / 60)
                 lines.append(f"- {label}：剩余 {remaining}，操作人 {b.get('by', '未知')}")
         else:
             lines.append("当前没有被封禁的用户。")
@@ -1929,7 +2094,7 @@ class AutoIssuePlugin(Star):
                 label = f"{st['name']}（{uid}）" if st.get("name") else uid
                 last = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.get("last", 0)))
                 lines.append(f"- {label}：{st['count']} 次，最近 {last}")
-        lines += ["", "用法：/issue ban @用户 <分钟>，0 为解封；/issue ban @用户 clear 清空违规记录。"]
+        lines += ["", "用法：/issue ban @用户 <时长>，如 30、30m、3小时、两个半小时、1天6小时；0 为解封，clear 清空违规记录。"]
         return "\n".join(lines)
 
     def _ban_remaining(self, event: AstrMessageEvent) -> int | None:
@@ -1947,10 +2112,20 @@ class AutoIssuePlugin(Star):
         return math.ceil(left / 60)
 
     @staticmethod
-    def _format_minutes(minutes: int) -> str:
-        days, rest = divmod(minutes, 1440)
-        hours, mins = divmod(rest, 60)
-        parts = [f"{days} 天" if days else "", f"{hours} 小时" if hours else "", f"{mins} 分钟" if mins else ""]
+    def _format_minutes(minutes: float) -> str:
+        """把分钟数格式化为「1 年 2 个月 3 天 4 小时 5 分钟」这样的可读文本。"""
+        total = max(0, int(round(minutes)))
+        years, total = divmod(total, 525600)
+        months, total = divmod(total, 43200)
+        days, total = divmod(total, 1440)
+        hours, mins = divmod(total, 60)
+        parts = [
+            f"{years} 年" if years else "",
+            f"{months} 个月" if months else "",
+            f"{days} 天" if days else "",
+            f"{hours} 小时" if hours else "",
+            f"{mins} 分钟" if mins else "",
+        ]
         return " ".join(x for x in parts if x) or "0 分钟"
 
     def _load_bans(self):
