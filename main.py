@@ -6,6 +6,7 @@ import math
 import re
 import shutil
 import time
+import unicodedata
 import uuid
 from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
@@ -66,6 +67,9 @@ CN_DIGITS = {
     "七": 7, "柒": 7, "八": 8, "捌": 8, "九": 9, "玖": 9,
 }
 CN_UNITS = {"十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000}
+CN_BIG_UNITS = {"万": 10**4, "萬": 10**4, "亿": 10**8, "億": 10**8, "兆": 10**12}
+# 封禁时长上限（分钟），超过时无法保存，按无法识别处理
+MAX_BAN_MINUTES = 10**30
 WORD_NUMBERS = {"半": 0.5, "俩": 2, "仨": 3, "一": 1}
 # 单位别名 -> 分钟数
 DURATION_UNITS = {
@@ -81,15 +85,15 @@ DURATION_UNITS = {
     "y": 525600, "yr": 525600, "year": 525600, "years": 525600,
     "年": 525600, "个年": 525600,
 }
-# 数字：阿拉伯数字、中文数字、半 / 俩 / 仨
-NUM_TOKEN = re.compile(r"\d+(?:\.\d+)?|[" + "".join(CN_DIGITS) + "".join(CN_UNITS) + r"]+|半|俩|仨")
+# 数字：阿拉伯数字、中文数字（含 万 / 亿 / 兆 等大单位）、半 / 俩 / 仨
+NUM_TOKEN = re.compile(
+    r"\d+(?:\.\d+)?|[" + "".join(CN_DIGITS) + "".join(CN_UNITS) + "".join(CN_BIG_UNITS) + r"]+|半|俩|仨"
+)
 # 单位：英文缩写，或汉字（「个小时」「星期」等可能不止一个字）
 UNIT_TOKEN = re.compile(r"[a-zA-Z]+|[一-龥]+")
 # 时长前后可以忽略的填充字，如「请封他三个小时」「5分钟吧」
 FILLER_CHARS = "的了吧啊呀呢哦嗯请帮我给他她着您禁封号射，,。：:；;！!？?、 "
 NOISE_WORDS = ("の", "　")
-# 纯数字超过这个长度就不当成时长，防止 13 位时间戳被误读
-MAX_NUM_CHARS = 6
 
 
 def parse_duration(text: str) -> float | None:
@@ -112,8 +116,6 @@ def parse_duration(text: str) -> float | None:
         if not m:
             return None
         num_text = m.group(0)
-        if num_text.isascii() and len(num_text.split(".")[0]) > MAX_NUM_CHARS:
-            return None
         value = _text_to_number(num_text)
         if value is None:
             return None
@@ -181,26 +183,36 @@ def _text_to_number(text: str) -> float | None:
         # 只有数字：按十进制拼接（一二三 -> 123）
         return float("".join(str(CN_DIGITS[c]) for c in text))
 
-    # 含单位的中文数字：按 节值 + 待处理数字 累加
-    # 例：十五 -> 15，二十三 -> 23，一百二十 -> 120，三千 -> 3000
+    # 含单位的中文数字。section 是不足一万的当前节，result 是已经乘过大单位的部分
+    # 例：十五 -> 15，一百零八 -> 108，一亿三千万 -> 130000000，一千万亿 -> 10^15
+    result = 0.0
     section = 0.0
     number = 0.0
+    last_big = 0
     for ch in text:
         if ch in CN_DIGITS:
             number = CN_DIGITS[ch]
-        elif ch in {"万", "萬"}:
-            section = (section + number or 1) * 10000
-            number = 0
-        elif ch == "亿":
-            section = (section + number or 1) * 100000000
-            number = 0
         elif ch in CN_UNITS:
             # 「十五」「十六」这类省略了前面的「一」
             section += (number or 1) * CN_UNITS[ch]
             number = 0
+        elif ch in CN_BIG_UNITS:
+            big = CN_BIG_UNITS[ch]
+            section += number
+            number = 0
+            if result and big >= last_big and not section:
+                # 大单位叠用：「一千万亿」=（一千万）× 亿，「一亿亿」=（一亿）× 亿
+                result *= big
+            elif result and big > last_big:
+                result = (result + section) * big
+            else:
+                # 「万」前面没有数字时按 1 计
+                result += (section or 1) * big
+            last_big = big
+            section = 0
         else:
             return None
-    return float(section + number)
+    return float(result + section + number)
 
 
 BODY_PREVIEW_LIMIT = 800
@@ -237,6 +249,23 @@ __REJECT_RULES__
 只输出一个 JSON 对象，不要输出其他文字：
 {"results": [{"index": 1, "ok": true, "reason": ""}, {"index": 2, "ok": false, "reason": "一句话说明原因，不要复述违规内容"}]}
 results 必须覆盖每一个草稿。"""
+
+# 消息文本中的 @昵称(ID)，检查违禁词前去掉，避免别人的昵称连累发送者
+MENTION_PATTERN = re.compile(r"@[^@]*?\(\d+\)")
+
+
+def compile_banned_word(word: str) -> re.Pattern | None:
+    """把违禁词编译成正则：字符之间允许夹杂空格、标点、符号（如「g a y」「猫*娘」）。"""
+    word = unicodedata.normalize("NFKC", word).lower()
+    chars = [c for c in word if not c.isspace()]
+    if not chars:
+        return None
+    body = r"[\W_]*".join(re.escape(c) for c in chars)
+    # 英文词前面不能紧挨着字母或数字，避免「omega yes」这类误判
+    if chars[0].isascii() and chars[0].isalnum():
+        body = r"(?<![a-z0-9])" + body
+    return re.compile(body)
+
 
 # 第 3 次违规起的封禁分钟数：5 分钟、15 分钟、1 小时、6 小时、12 小时、1 天、3 天、7 天，之后保持 7 天
 STRIKE_BAN_MINUTES = [5, 15, 60, 6 * 60, 12 * 60, 24 * 60, 3 * 24 * 60, 7 * 24 * 60]
@@ -382,7 +411,7 @@ class IssueSessionFilter(SessionFilter):
     PLUGIN_NAME,
     "YourName",
     "群聊需求转 GitHub Issue：AI 多轮追问补全细节，预览确认后发布",
-    "1.6.2",
+    "1.7.0",
 )
 class AutoIssuePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -394,6 +423,7 @@ class AutoIssuePlugin(Star):
         self.bans: dict[str, dict] = {}
         # user_id -> {"count": 违规次数, "name": 昵称, "last": 最近一次违规时间戳}
         self.strikes: dict[str, dict] = {}
+        self._banned_cache: tuple[tuple[str, ...], list[tuple[str, re.Pattern]]] = ((), [])
         # 进行中的会话：会话 key -> (会话状态, 会话控制器)，用于封禁时结束发起人的会话
         self.active_sessions: dict[str, tuple[IssueSession, SessionController]] = {}
         try:
@@ -426,6 +456,11 @@ class AutoIssuePlugin(Star):
         deny_reason = self._check_permission(event) or self._check_configured(event)
         if deny_reason:
             yield event.plain_result(deny_reason)
+            return
+
+        hit = self._banned_hit(self._message_text(event))
+        if hit:
+            await self._reject_banned(event, hit)
             return
 
         if not args:
@@ -519,7 +554,10 @@ class AutoIssuePlugin(Star):
             )
         except TimeoutError:
             if not state.closed:
-                tip = f"（{len(state.drafts)} 个草稿未发布）" if state.drafts else ""
+                tip = ""
+                if state.drafts:
+                    wait = "等待审核超时，" if self._approval_required() else ""
+                    tip = f"（{len(state.drafts)} 个草稿{wait}未发布）"
                 yield event.plain_result(f"issue 收集会话已超时结束{tip}。")
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] session error: {e}", exc_info=True)
@@ -542,6 +580,14 @@ class AutoIssuePlugin(Star):
         # 被封禁用户的消息不记录、不响应
         if self._ban_remaining(event) is not None:
             return
+
+        # 含违禁词的消息直接拒绝，不记录
+        hit = self._banned_hit(self._message_text(event))
+        if hit:
+            await self._reject_banned(event, hit)
+            return
+
+        timeout = self._wait_timeout(state, timeout)
 
         # 会话中也允许使用查询类子指令，不计入对话
         if is_cmd and event.is_at_or_wake_command:
@@ -575,16 +621,27 @@ class AutoIssuePlugin(Star):
 
         confirm = CONFIRM_PATTERN.fullmatch(lowered) if state.drafts else None
         if confirm:
-            if not self._can_operate(event, state):
-                await event.send(event.plain_result("只有发起人或管理员可以确认发布。"))
+            if not self._can_approve(event, state):
+                await event.send(event.plain_result(self._approval_denied_tip()))
                 return
             await self._publish(controller, event, state, confirm.group(2), timeout)
             return
 
         draft_cmd = DRAFT_CMD_PATTERN.fullmatch(text) if state.drafts else None
         if draft_cmd:
-            if not self._can_operate(event, state):
-                await event.send(event.plain_result("只有发起人或管理员可以处理草稿。"))
+            # 「放弃」不会发布内容，发起人也可以操作；「关联」「评论」会发布，需要审核权限
+            allowed = (
+                self._can_operate(event, state)
+                if draft_cmd.group(1) == "放弃"
+                else self._can_approve(event, state)
+            )
+            if not allowed:
+                tip = (
+                    "只有发起人或管理员可以放弃草稿。"
+                    if draft_cmd.group(1) == "放弃"
+                    else self._approval_denied_tip()
+                )
+                await event.send(event.plain_result(tip))
                 return
             await self._draft_command(controller, event, state, *draft_cmd.groups(), timeout)
             return
@@ -610,6 +667,7 @@ class AutoIssuePlugin(Star):
             return
         controller.keep(timeout=timeout, reset_timeout=True)
         await self._advance(event, state)
+        self._keep_for_approval(controller, state, timeout)
 
     async def _collect(
         self,
@@ -638,6 +696,7 @@ class AutoIssuePlugin(Star):
         controller.keep(timeout=timeout, reset_timeout=True)
         await event.send(event.plain_result("收到，正在整理…"))
         await self._advance(event, state)
+        self._keep_for_approval(controller, state, timeout)
 
     async def _publish(
         self,
@@ -790,12 +849,22 @@ class AutoIssuePlugin(Star):
             drafts = self._parse_drafts(state, result) if action == "draft" else []
             if action == "draft" and not drafts:
                 raise RuntimeError("AI 未给出有效的草稿")
+            # 含违禁词的草稿直接移除
+            clean = []
+            for d in drafts:
+                hit = self._banned_hit(" ".join([d.title, d.body, *d.labels]))
+                if hit:
+                    removed.append("包含违禁词")
+                else:
+                    clean.append(d)
+            drafts = clean
             if drafts and self.config.get("content_review", True):
-                drafts, removed = await self._review_drafts(event, drafts)
-                if not drafts:
-                    # 全部草稿未通过审核，按拒绝处理
-                    action = "reject"
-                    result = {"message": f"无法生成 issue：{'；'.join(dict.fromkeys(removed))}"}
+                drafts, review_removed = await self._review_drafts(event, drafts)
+                removed += review_removed
+            if action == "draft" and not drafts:
+                # 全部草稿被移除，按拒绝处理
+                action = "reject"
+                result = {"message": f"无法生成 issue：{'；'.join(dict.fromkeys(removed))}"}
         except Exception as e:
             error = e
 
@@ -818,7 +887,9 @@ class AutoIssuePlugin(Star):
 
         if action == "reject" and first:
             # 收集到的内容整体无关：清空记录，回到收集阶段
-            message = str(result.get("message") or "").strip() or "这与项目开发无关，无法生成 issue。"
+            message = self._mask_banned(
+                str(result.get("message") or "").strip() or "这与项目开发无关，无法生成 issue。"
+            )
             state.transcript.clear()
             self._discard_images(state.images)
             state.images.clear()
@@ -842,9 +913,12 @@ class AutoIssuePlugin(Star):
 
         if action == "reject":
             self._rollback(state, batch)
-            message = str(result.get("message") or "").strip() or "这与项目开发无关，无法生成 issue。"
+            message = self._mask_banned(
+                str(result.get("message") or "").strip() or "这与项目开发无关，无法生成 issue。"
+            )
             if state.drafts:
-                message += f"\n当前 {len(state.drafts)} 个草稿不受影响，可回复「确认」发布或继续修改。"
+                who = "等待管理员回复「确认」发布" if self._approval_required() else "可回复「确认」发布"
+                message += f"\n当前 {len(state.drafts)} 个草稿不受影响，{who}或继续修改。"
             else:
                 message += f"\n如有项目相关的问题请继续描述并发送「{CONTINUE_WORD}」，或发送「取消」退出。"
             await event.send(event.plain_result(message))
@@ -865,10 +939,11 @@ class AutoIssuePlugin(Star):
                     ("assistant", "助手", f"（另有 {len(removed)} 个草稿因违规被移除，不要再生成：{reasons}）")
                 )
                 preview = f"⚠️ 已移除 {len(removed)} 个未通过内容审核的草稿：{reasons}\n\n{preview}"
-            await event.send(event.plain_result(preview))
+            # 相关 issue 的标题和摘要来自仓库，也要屏蔽违禁词
+            await event.send(event.plain_result(self._mask_banned(preview)))
             return
 
-        message = str(result.get("message") or "").strip()
+        message = self._mask_banned(str(result.get("message") or "").strip())
         if not message:
             message = "能再详细描述一下吗？"
         state.ask_rounds += 1
@@ -932,6 +1007,9 @@ class AutoIssuePlugin(Star):
             system_prompt += f"- labels 只能从以下列表中选择 0~3 个：{json.dumps(labels, ensure_ascii=False)}\n"
         # 安全规则放在最后，优先级最高
         system_prompt += SAFETY_PROMPT.replace("__REJECT_RULES__", self._reject_rules())
+        banned = [w for w, _ in self._banned_patterns()]
+        if banned:
+            system_prompt += f"- 以下为违禁词，不得出现在你的任何输出中：{json.dumps(banned, ensure_ascii=False)}\n"
 
         parts = []
         project_context = self.config.get("project_context", "").strip()
@@ -1730,18 +1808,25 @@ class AutoIssuePlugin(Star):
     def _action_tip(self, state: IssueSession) -> str:
         multi = len(state.drafts) > 1
         n = "1 " if multi else ""
+        approval = self._approval_required()
+        who = "管理员" if approval else ""
         lines = []
+        if approval:
+            lines.append("⏳ 等待管理员审核，审核通过后才会发布。")
         if multi:
-            lines.append("回复「确认」全部新建，「确认 1 3」只新建指定编号，「取消」放弃全部。")
+            lines.append(f"{who}回复「确认」全部新建，「确认 1 3」只新建指定编号。")
         else:
-            lines.append("回复「确认」新建，「取消」放弃。")
+            lines.append(f"{who}回复「确认」新建。")
         if any(d.related for d in state.drafts):
             lines += [
-                "存在可能相关的已有 issue，还可以：",
+                f"存在可能相关的已有 issue，{who}还可以：",
                 f"「评论 {n}#12」改为在原 issue 下评论（不新建）",
                 f"「关联 {n}#12」新建 issue 并在正文中提及原 issue",
-                f"「放弃{' ' + n.strip() if multi else ''}」不发送该草稿",
             ]
+        lines.append(
+            f"发起人可以回复「放弃{' ' + n.strip() if multi else ''}」不发送"
+            + ("某个草稿，或「取消」放弃全部。" if multi else "该草稿，或「取消」结束本次收集。")
+        )
         lines.append(f"需要修改时直接回复修改意见，然后由发起人发送「{CONTINUE_WORD}」。")
         return "\n".join(lines)
 
@@ -1879,9 +1964,9 @@ class AutoIssuePlugin(Star):
         ended = self._end_sessions_of(target_id)
         msg = (
             f"已禁止 {label} 使用 issue 功能 {self._format_minutes(minutes)}，"
-            f"到 {time.strftime('%Y-%m-%d %H:%M', time.localtime(until))} 解封。"
-            "\n封禁期间该用户不能发起 issue、查询或评论，在进行中的会话里发送的消息也会被忽略。"
+            f"到 {self._format_until(until)} 解封。"
         )
+        msg += "\n封禁期间该用户不能发起 issue、查询或评论，在进行中的会话里发送的消息也会被忽略。"
         if ended:
             msg += f"\n该用户发起的 {ended} 个 issue 收集会话已结束，草稿未发布。"
         return msg
@@ -1890,11 +1975,25 @@ class AutoIssuePlugin(Star):
         self, event: AstrMessageEvent, state: IssueSession
     ) -> dict[str, tuple[str, list[str]]]:
         """检测本批新消息中的违规内容，返回 {user_id: (昵称, [原因])}。检测失败时返回空。"""
-        if not self.config.get("violation_check", True):
-            return {}
         t_start, i_start = state.moderated
         t_end, i_end = len(state.transcript), len(state.images)
         state.moderated = (t_end, i_end)
+
+        # 图片识别结果中出现违禁词：屏蔽图片并处罚发送者（文字消息在收到时已经检查过）
+        admins = self._admin_ids()
+        banned_result: dict[str, tuple[str, list[str]]] = {}
+        for idx in range(i_start, i_end):
+            img = state.images[idx]
+            hit = self._banned_hit(img.description or "") if not img.blocked else None
+            if not hit:
+                continue
+            img.blocked = True
+            img.description = "（违规图片，已移除）"
+            name, uid = self._split_speaker(img.sender)
+            if uid and uid not in admins:
+                banned_result.setdefault(uid, (name, []))[1].append(f"图片中包含违禁词「{hit}」")
+        if not self.config.get("violation_check", True):
+            return banned_result
 
         items = []  # (编号, 来源, 下标, 发送者)
         payload = []
@@ -1925,10 +2024,9 @@ class AutoIssuePlugin(Star):
                 raise RuntimeError("AI 输出格式异常")
         except Exception as e:
             logger.warning(f"[{PLUGIN_NAME}] violation check failed: {e}")
-            return {}
+            return banned_result
 
-        admins = self._admin_ids()
-        result: dict[str, tuple[str, list[str]]] = {}
+        result: dict[str, tuple[str, list[str]]] = banned_result
         for v in flagged:
             if not isinstance(v, dict) or not str(v.get("id", "")).isdigit():
                 continue
@@ -1961,7 +2059,11 @@ class AutoIssuePlugin(Star):
         return result
 
     async def _punish_violations(
-        self, event: AstrMessageEvent, state: IssueSession, violations: dict[str, tuple[str, list[str]]]
+        self,
+        event: AstrMessageEvent,
+        state: IssueSession | None,
+        violations: dict[str, tuple[str, list[str]]],
+        note: str = "",
     ):
         """累计违规次数并发出警告；第 3 次起封禁，时长逐步加倍，上限 7 天。"""
         if not violations:
@@ -1987,16 +2089,101 @@ class AutoIssuePlugin(Star):
                 text = (
                     f" 【处罚通知】你已第 {count} 次发布违规内容（{reason}），"
                     f"禁止使用 issue 功能 {self._format_minutes(minutes)}，"
-                    f"至 {time.strftime('%Y-%m-%d %H:%M', time.localtime(until))} 解除。再次违规将加重处罚。"
+                    f"至 {self._format_until(until)} 解除。再次违规将加重处罚。"
                 )
                 to_end.append(uid)
-            chain += [Comp.At(qq=uid, name=name), Comp.Plain(text)]
+            chain += [Comp.At(qq=uid, name=name), Comp.Plain(text + note)]
         self._save_strikes()
 
         await event.send(event.chain_result(chain))
         for uid in to_end:
             if self._end_sessions_of(uid):
                 await event.send(event.plain_result("由于发起人被禁止使用 issue 功能，本次 issue 收集已结束，草稿未发布。"))
+
+    # ------------------------------------------------------------------ 违禁词
+
+    def _banned_patterns(self) -> list[tuple[str, re.Pattern]]:
+        words = tuple(
+            str(w).strip() for w in self.config.get("banned_words", []) or [] if str(w).strip()
+        )
+        if self._banned_cache[0] != words:
+            compiled = [(w, compile_banned_word(w)) for w in words]
+            self._banned_cache = (words, [(w, c) for w, c in compiled if c is not None])
+        return self._banned_cache[1]
+
+    def _banned_hit(self, text: str) -> str | None:
+        """返回文本中出现的第一个违禁词，没有时返回 None。"""
+        if not text:
+            return None
+        normalized = unicodedata.normalize("NFKC", text).lower()
+        for word, pattern in self._banned_patterns():
+            if pattern.search(normalized):
+                return word
+        return None
+
+    def _mask_banned(self, text: str) -> str:
+        """把机器人要发出的文字中的违禁词替换为 *。"""
+        if not text or not self._banned_patterns():
+            return text
+        normalized = unicodedata.normalize("NFKC", text)
+        if len(normalized) != len(text):
+            text = normalized
+        lowered = text.lower()
+        spans = [m.span() for _, p in self._banned_patterns() for m in p.finditer(lowered)]
+        if not spans:
+            return text
+        chars = list(text)
+        for start, end in spans:
+            for i in range(start, end):
+                chars[i] = "*"
+        return "".join(chars)
+
+    @staticmethod
+    def _message_text(event: AstrMessageEvent) -> str:
+        """取消息的文字部分，去掉 @某人 的昵称。"""
+        return MENTION_PATTERN.sub(" ", event.message_str or "")
+
+    async def _reject_banned(self, event: AstrMessageEvent, word: str):
+        """消息包含违禁词：拒绝记录，并按违规处罚（管理员只提示不处罚）。"""
+        if event.is_admin():
+            await event.send(event.plain_result(f"该消息包含违禁词「{word}」，已拒绝记录。"))
+            return
+        await self._punish_violations(
+            event,
+            None,
+            {str(event.get_sender_id()): (event.get_sender_name(), [f"包含违禁词「{word}」"])},
+            note="该消息已被拒绝。",
+        )
+
+    # ------------------------------------------------------------------ 审核
+
+    def _approval_required(self) -> bool:
+        return bool(self.config.get("require_admin_approval", True))
+
+    def _can_approve(self, event: AstrMessageEvent, state: IssueSession) -> bool:
+        """能否确认发布：开启审核时只有管理员和审核员可以，否则沿用发起人等规则。"""
+        if not self._approval_required():
+            return self._can_operate(event, state)
+        if event.is_admin():
+            return True
+        approvers = {str(u).strip() for u in self.config.get("approvers", []) if str(u).strip()}
+        return str(event.get_sender_id()) in approvers
+
+    def _approval_denied_tip(self) -> str:
+        return (
+            "草稿需要管理员审核后才能发布。"
+            f"你可以直接回复修改意见，然后由发起人发送「{CONTINUE_WORD}」重新生成草稿。"
+        )
+
+    def _wait_timeout(self, state: IssueSession, timeout: int) -> int:
+        """等待管理员审核时使用更长的超时时间。"""
+        if state.drafts and self._approval_required():
+            return max(timeout, int(self.config.get("approval_timeout", 1800)))
+        return timeout
+
+    def _keep_for_approval(self, controller: SessionController, state: IssueSession, timeout: int):
+        if state.drafts and not state.closed and self._approval_required():
+            controller.keep(timeout=self._wait_timeout(state, timeout), reset_timeout=True)
 
     @staticmethod
     def _strike_minutes(count: int) -> int:
@@ -2051,12 +2238,13 @@ class AutoIssuePlugin(Star):
         return until
 
     def _parse_ban_minutes(self, arg: str) -> int | None:
-        """解析封禁时长，返回分钟数（整数，向上取整），无法识别或为负时返回 None。"""
+        """解析封禁时长，返回分钟数（整数，向上取整），无法识别、为负或过大时返回 None。"""
         arg = arg.strip()
         if re.fullmatch(r"\d+", arg):
-            return int(arg)
+            minutes = int(arg)
+            return minutes if minutes <= MAX_BAN_MINUTES else None
         minutes = parse_duration(arg)
-        if minutes is None or minutes < 0:
+        if minutes is None or minutes < 0 or not math.isfinite(minutes) or minutes > MAX_BAN_MINUTES:
             return None
         # 小于 1 分钟按 1 分钟处理，避免出现 0 分钟被当成解封
         return max(1, math.ceil(minutes))
@@ -2113,20 +2301,44 @@ class AutoIssuePlugin(Star):
 
     @staticmethod
     def _format_minutes(minutes: float) -> str:
-        """把分钟数格式化为「1 年 2 个月 3 天 4 小时 5 分钟」这样的可读文本。"""
+        """把分钟数格式化为「1 年 2 个月 3 天 4 小时 5 分钟」这样的可读文本，年数很大时用万 / 亿表示。"""
         total = max(0, int(round(minutes)))
         years, total = divmod(total, 525600)
         months, total = divmod(total, 43200)
         days, total = divmod(total, 1440)
         hours, mins = divmod(total, 60)
         parts = [
-            f"{years} 年" if years else "",
+            f"{AutoIssuePlugin._format_big_number(years)}{'' if years >= 100000 else ' '}年" if years else "",
             f"{months} 个月" if months else "",
             f"{days} 天" if days else "",
             f"{hours} 小时" if hours else "",
             f"{mins} 分钟" if mins else "",
         ]
         return " ".join(x for x in parts if x) or "0 分钟"
+
+    @staticmethod
+    def _format_big_number(n: int) -> str:
+        """把很大的整数写成「1 亿」「1000 万亿」这样的形式，10 万以内原样输出。"""
+        if n < 100000:
+            return str(n)
+        units = [(10**16, "亿亿"), (10**12, "万亿"), (10**8, "亿"), (10**4, "万")]
+        parts = []
+        for size, name in units:
+            if n >= size:
+                head, n = divmod(n, size)
+                parts.append(f"{AutoIssuePlugin._format_big_number(head)}{name}")
+        if n:
+            parts.append(str(n))
+        return "".join(parts)
+
+    @staticmethod
+    def _format_until(until: float) -> str:
+        """格式化解封时间。超出系统日期范围时只显示年份。"""
+        try:
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(until))
+        except (OverflowError, OSError, ValueError):
+            year = time.localtime().tm_year + int((until - time.time()) // (365 * 86400))
+            return f"公元 {AutoIssuePlugin._format_big_number(year)} 年"
 
     def _load_bans(self):
         if self.data_dir is None:

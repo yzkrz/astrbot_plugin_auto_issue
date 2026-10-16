@@ -53,6 +53,24 @@
     "default": true,
     "hint": "关闭后，未绑定 Token 的用户不能发起 issue 或评论（仍可查询）"
   },
+  "require_admin_approval": {
+    "description": "发布前需要管理员审核",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，草稿预览出来后只有 AstrBot 管理员或「审核员」回复「确认」才能发布（「关联」「评论」同样需要审核）。其他人包括发起人只能提修改意见，发起人仍可「放弃」草稿或「取消」"
+  },
+  "approvers": {
+    "description": "审核员",
+    "type": "list",
+    "default": [],
+    "hint": "填写聊天平台用户 ID。除 AstrBot 管理员外，这些用户也可以审核发布"
+  },
+  "approval_timeout": {
+    "description": "等待审核的超时时间（秒）",
+    "type": "int",
+    "default": 1800,
+    "hint": "出草稿后等待管理员审核的时间，期间无人发言也不会超时，避免管理员不在线时草稿丢失"
+  },
   "github_api_base": {
     "description": "GitHub API 地址",
     "type": "string",
@@ -96,6 +114,12 @@
     "type": "text",
     "default": "",
     "hint": "每行一条，会同时加入整理和审核的提示词。例如：不接受修改项目名称和 Logo 的需求"
+  },
+  "banned_words": {
+    "description": "违禁词",
+    "type": "list",
+    "default": [],
+    "hint": "消息中出现任意违禁词（不区分大小写，字符间夹杂空格或符号也能识别）会被直接拒绝并按违规计次警告。AI 生成的草稿和回复中出现违禁词也会被移除或打码。管理员发送时只拒绝不处罚"
   },
   "violation_check": {
     "description": "检测群聊违规内容",
