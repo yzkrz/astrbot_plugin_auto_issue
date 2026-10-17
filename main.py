@@ -440,7 +440,7 @@ class IssueSessionFilter(SessionFilter):
     PLUGIN_NAME,
     "YourName",
     "群聊需求转 GitHub Issue：AI 多轮追问补全细节，预览确认后发布",
-    "1.8.1",
+    "1.8.2",
 )
 class AutoIssuePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -2268,10 +2268,12 @@ class AutoIssuePlugin(Star):
             minutes,
             f"{event.get_sender_name()}（{event.get_sender_id()}）",
         )
+        # 管理员手动封禁同样计入违规次数
+        count = self._add_strike(target_id, target_name)
         ended = self._end_sessions_of(target_id)
         msg = (
             f"已禁止 {label} 使用 issue 功能 {self._format_minutes(minutes)}，"
-            f"到 {self._format_until(until)} 解封。"
+            f"到 {self._format_until(until)} 解封。该用户累计违规 {count} 次。"
         )
         msg += "\n封禁期间该用户不能发起 issue、查询或评论，在进行中的会话里发送的消息也会被忽略。"
         if ended:
@@ -2365,12 +2367,8 @@ class AutoIssuePlugin(Star):
         chain: list = []
         to_end: list[str] = []
         for uid, (name, reasons) in violations.items():
-            record = self.strikes.setdefault(uid, {"count": 0, "name": name, "last": 0})
             # 同一批消息中多次违规只计一次
-            record["count"] += 1
-            record["name"] = name or record.get("name", "")
-            record["last"] = time.time()
-            count = record["count"]
+            count = self._add_strike(uid, name, save=False)
             # 空字符串表示不对外说明的原因（如 AI 输出检测），只公布处罚本身
             reason = "；".join(dict.fromkeys(r for r in reasons if r))
             why = f"（{reason}）" if reason else ""
@@ -2380,10 +2378,11 @@ class AutoIssuePlugin(Star):
             elif count == 2:
                 text = f" 【严重警告】你已第 2 次发布违规内容{why}。请勿发布违规消息，再次违规将被禁言。"
             else:
+                # 封禁通知一律不说明原因
                 minutes = self._strike_minutes(count)
                 until = self._apply_ban(uid, name, minutes, "自动处罚")
                 text = (
-                    f" 【处罚通知】你已第 {count} 次发布违规内容{why}，"
+                    f" 【处罚通知】你已第 {count} 次违规，"
                     f"禁止使用 issue 功能 {self._format_minutes(minutes)}，"
                     f"至 {self._format_until(until)} 解除。再次违规将加重处罚。"
                 )
@@ -2496,6 +2495,16 @@ class AutoIssuePlugin(Star):
     def _keep_for_approval(self, controller: SessionController, state: IssueSession, timeout: int):
         if state.drafts and not state.closed and self._approval_required():
             controller.keep(timeout=self._wait_timeout(state, timeout), reset_timeout=True)
+
+    def _add_strike(self, uid: str, name: str, save: bool = True) -> int:
+        """给用户记一次违规，返回累计次数。"""
+        record = self.strikes.setdefault(uid, {"count": 0, "name": name, "last": 0})
+        record["count"] += 1
+        record["name"] = name or record.get("name", "")
+        record["last"] = time.time()
+        if save:
+            self._save_strikes()
+        return record["count"]
 
     @staticmethod
     def _strike_minutes(count: int) -> int:
