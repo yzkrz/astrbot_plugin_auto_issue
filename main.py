@@ -9,6 +9,7 @@ import time
 import unicodedata
 import uuid
 from decimal import Decimal, InvalidOperation
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,10 @@ PLUGIN_NAME = "astrbot_plugin_auto_issue"
 CANCEL_WORDS = {"取消", "退出", "结束", "算了", "cancel", "quit", "exit"}
 START_WORD = "生成"
 CONTINUE_WORD = "继续"
+RESTART_WORDS = {"重启", "恢复", "restart"}
+# 机器人发出的草稿预览末尾带有这一行，用来识别可重启的预览
+PREVIEW_ID_PREFIX = "预览编号："
+PREVIEW_ID_PATTERN = re.compile(r"预览编号[:：]\s*(IS-[0-9A-F]{8})")
 CONFIRM_PATTERN = re.compile(r"(确认发布|确认|发布|提交|确定|生成|ok|yes|y)\s*([\d\s,，、]*)")
 # 针对单个草稿的操作：关联 / 评论 / 放弃 [草稿编号] [#issue 编号]
 DRAFT_CMD_PATTERN = re.compile(r"(关联|评论|放弃)\s*([\d\s,，、]*?)\s*((?:#\d+[\s,，、]*)*)")
@@ -387,6 +392,10 @@ class IssueSession:
     mark: tuple[int, int, dict[str, str]] | None = None
     # 已做过违规检测的对话条数和图片数，避免同一条消息被重复计入
     moderated: tuple[int, int] = (0, 0)
+    # 会话来源，重启时只能在原会话中恢复
+    umo: str = ""
+    # 草稿预览编号，出第一次草稿时生成，用于引用重启
+    preview_id: str = ""
 
 
 class IssueSessionFilter(SessionFilter):
@@ -414,7 +423,7 @@ class IssueSessionFilter(SessionFilter):
     PLUGIN_NAME,
     "YourName",
     "群聊需求转 GitHub Issue：AI 多轮追问补全细节，预览确认后发布",
-    "1.7.1",
+    "1.8.0",
 )
 class AutoIssuePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -429,21 +438,26 @@ class AutoIssuePlugin(Star):
         self._banned_cache: tuple[tuple[str, ...], list[tuple[str, re.Pattern]]] = ((), [])
         # 进行中的会话：会话 key -> (会话状态, 会话控制器)，用于封禁时结束发起人的会话
         self.active_sessions: dict[str, tuple[IssueSession, SessionController]] = {}
+        # 正在启动或运行中的会话 key。会话控制器要等第一条提示发出后才登记，
+        # 这里提前占位，避免同一个群同时启动两个会话
+        self.reserved_keys: set[str] = set()
         try:
             self.data_dir = StarTools.get_data_dir(PLUGIN_NAME)
             self._load_bans()
             self._load_strikes()
         except Exception as e:
             logger.warning(f"[{PLUGIN_NAME}] 无法读取插件数据目录，封禁记录将不会保存：{e}")
+        # 预览编号 -> {"saved_at": 保存时间, "state": 会话状态}，用于引用预览重启
+        self.snapshots: dict[str, dict] = {}
         self.image_dir: Path | None = None
         try:
             self.image_dir = StarTools.get_data_dir(PLUGIN_NAME) / "images"
-            # 清理上次运行残留的图片副本
-            shutil.rmtree(self.image_dir, ignore_errors=True)
             self.image_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             logger.warning(f"[{PLUGIN_NAME}] 无法创建图片目录，将直接使用临时文件识图：{e}")
             self.image_dir = None
+        self._load_snapshots()
+        self._clean_orphan_images()
 
     # ------------------------------------------------------------------ 指令
 
@@ -511,32 +525,47 @@ class AutoIssuePlugin(Star):
 
     # ------------------------------------------------------------------ 新建会话
 
+    def _group_busy(self, event: AstrMessageEvent) -> bool:
+        """本群（本会话）是否已有进行中或正在启动的 issue 会话。"""
+        key = IssueSessionFilter.key_of(event)
+        return key in USER_SESSIONS or key in self.reserved_keys
+
     async def _run_new_session(self, event: AstrMessageEvent):
         """进入生成模式，从下一条消息开始记录。"""
-        if IssueSessionFilter.key_of(event) in USER_SESSIONS:
+        if self._group_busy(event):
             yield event.plain_result("当前会话已有进行中的 issue 收集，请先完成或发送「取消」。")
             return
 
-        state = IssueSession(
-            initiator_id=str(event.get_sender_id()),
-            initiator_name=event.get_sender_name(),
-            group_id=str(event.get_group_id() or ""),
-            platform=event.get_platform_name(),
-        )
-        state.participants[state.initiator_id] = state.initiator_name
+        key = IssueSessionFilter.key_of(event)
+        self.reserved_keys.add(key)
+        try:
+            state = IssueSession(
+                initiator_id=str(event.get_sender_id()),
+                initiator_name=event.get_sender_name(),
+                group_id=str(event.get_group_id() or ""),
+                platform=event.get_platform_name(),
+                umo=event.unified_msg_origin,
+            )
+            state.participants[state.initiator_id] = state.initiator_name
 
-        yield event.plain_result(
-            "📝 已进入 issue 生成模式，接下来的文字和图片都会被记录。\n"
-            "请描述你遇到的问题或想要的功能，可以分多条发送，也可以一次说多个问题"
-            "（我会拆分成多个 issue）。\n"
-            f"描述完毕后发送「{START_WORD}」，我会整理信息并追问细节；发送「取消」退出。"
-        )
+            yield event.plain_result(
+                "📝 已进入 issue 生成模式，接下来的文字和图片都会被记录。\n"
+                "请描述你遇到的问题或想要的功能，可以分多条发送，也可以一次说多个问题"
+                "（我会拆分成多个 issue）。\n"
+                f"描述完毕后发送「{START_WORD}」，我会整理信息并追问细节；发送「取消」退出。"
+            )
+            async for result in self._run_session(event, state):
+                yield result
+        finally:
+            self.reserved_keys.discard(key)
 
+    async def _run_session(self, event: AstrMessageEvent, state: IssueSession):
+        """等待并处理会话消息，直到会话结束或超时。"""
         timeout = max(30, int(self.config.get("session_timeout", 300)))
-
         key = IssueSessionFilter.key_of(event)
 
-        @session_waiter(timeout=timeout)
+        # 重启的会话一开始就在等待审核，使用审核超时
+        @session_waiter(timeout=self._wait_timeout(state, timeout))
         async def waiter(controller: SessionController, ev: AstrMessageEvent):
             await self._on_session_message(controller, ev, state, timeout)
 
@@ -560,15 +589,192 @@ class AutoIssuePlugin(Star):
                 tip = ""
                 if state.drafts:
                     wait = "等待审核超时，" if self._approval_required() else ""
-                    tip = f"（{len(state.drafts)} 个草稿{wait}未发布）"
+                    tip = (
+                        f"（{len(state.drafts)} 个草稿{wait}未发布，"
+                        f"管理员可引用草稿预览消息发送「重启」恢复，{PREVIEW_ID_PREFIX}{state.preview_id}）"
+                    )
                 yield event.plain_result(f"issue 收集会话已超时结束{tip}。")
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] session error: {e}", exc_info=True)
             yield event.plain_result(f"issue 收集会话异常结束：{e}")
         finally:
             self.active_sessions.pop(key, None)
-            self._discard_images(state.images)
+            if state.drafts and not state.closed and state.preview_id:
+                # 超时或异常结束：保留草稿和图片，管理员可以引用预览重启
+                self._save_snapshot(state)
+            else:
+                self._delete_snapshot(state.preview_id)
+                self._discard_images(state.images)
             event.stop_event()
+
+    # ------------------------------------------------------------------ 引用预览重启
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_restart(self, event: AstrMessageEvent):
+        """管理员引用机器人发出的草稿预览并发送「重启」，恢复已过期的会话。"""
+        preview_id = self._match_restart(event)
+        if not preview_id:
+            return
+        event.stop_event()
+        if not self._is_approver(event):
+            yield event.plain_result("只有管理员可以重启 issue 预览。")
+            return
+        deny_reason = self._check_permission(event)
+        if deny_reason:
+            yield event.plain_result(deny_reason)
+            return
+        if self._group_busy(event):
+            yield event.plain_result("本群当前已有进行中的 issue 收集，请先完成或「取消」后再重启。")
+            return
+
+        snapshot = self.snapshots.get(preview_id)
+        if snapshot is None:
+            yield event.plain_result(
+                f"{PREVIEW_ID_PREFIX}{preview_id} 已失效：草稿已经全部处理完毕、被取消，或超过了保留期限。"
+            )
+            return
+        state = self._restore_state(snapshot["state"])
+        if state.umo and state.umo != event.unified_msg_origin:
+            yield event.plain_result("只能在发起该 issue 的群聊中重启。")
+            return
+        if not state.drafts:
+            self._delete_snapshot(preview_id)
+            yield event.plain_result(f"{PREVIEW_ID_PREFIX}{preview_id} 没有待发布的草稿。")
+            return
+
+        key = IssueSessionFilter.key_of(event)
+        self.reserved_keys.add(key)
+        try:
+            yield event.plain_result(
+                f"♻️ 已由 {event.get_sender_name()} 重启 issue 预览（发起人：{state.initiator_name}）\n\n"
+                + self._mask_banned(self._render_preview(state))
+            )
+            async for result in self._run_session(event, state):
+                yield result
+        finally:
+            self.reserved_keys.discard(key)
+
+    def _match_restart(self, event: AstrMessageEvent) -> str:
+        """判断是否为「引用机器人发出的草稿预览 + 重启」，是则返回预览编号，否则返回空字符串。
+
+        必须同时满足：被引用的是机器人自己的消息（平台提供发送者时核对），
+        且消息中带有「预览编号：IS-XXXXXXXX」格式的标记。
+        """
+        text = self._message_text(event).strip().lstrip("/").strip()
+        if text.lower() not in RESTART_WORDS:
+            return ""
+        quoted = self._quoted_bot_text(event)
+        if not quoted:
+            return ""
+        m = PREVIEW_ID_PATTERN.search(quoted)
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _quoted_bot_text(event: AstrMessageEvent) -> str | None:
+        """取被引用的机器人消息的文字。没有引用、或引用的不是机器人自己发的消息时返回 None。"""
+        self_id = str(event.get_self_id())
+        for comp in event.get_messages():
+            if not isinstance(comp, Comp.Reply):
+                continue
+            sender = str(getattr(comp, "sender_id", "") or "")
+            # 平台没有提供发送者时无法核对，只依靠预览编号格式判断
+            if sender and sender != "0" and sender != self_id:
+                return None
+            parts = [str(getattr(comp, "message_str", "") or ""), str(getattr(comp, "text", "") or "")]
+            for c in getattr(comp, "chain", None) or []:
+                if isinstance(c, Comp.Plain):
+                    parts.append(str(c.text or ""))
+            return "\n".join(parts)
+        return None
+
+    def _is_approver(self, event: AstrMessageEvent) -> bool:
+        if event.is_admin():
+            return True
+        approvers = {str(u).strip() for u in self.config.get("approvers", []) if str(u).strip()}
+        return str(event.get_sender_id()) in approvers
+
+    # ------------------------------------------------------------------ 草稿快照
+
+    def _save_snapshot(self, state: IssueSession):
+        if not state.preview_id or not state.drafts:
+            return
+        data = dataclasses.asdict(state)
+        for key in ("mark", "closed"):
+            data.pop(key, None)
+        self.snapshots[state.preview_id] = {"saved_at": time.time(), "state": data}
+        self._write_snapshots()
+
+    def _delete_snapshot(self, preview_id: str):
+        if preview_id and self.snapshots.pop(preview_id, None) is not None:
+            self._write_snapshots()
+
+    @staticmethod
+    def _restore_state(data: dict) -> IssueSession:
+        def build(cls, values: dict):
+            names = {f.name for f in dataclasses.fields(cls)}
+            return cls(**{k: v for k, v in values.items() if k in names})
+
+        data = dict(data)
+        images = [build(ImageItem, i) for i in data.pop("images", [])]
+        drafts = [build(IssueDraft, d) for d in data.pop("drafts", [])]
+        transcript = [tuple(t) for t in data.pop("transcript", [])]
+        moderated = tuple(data.pop("moderated", (0, 0)))
+        state = build(IssueSession, data)
+        state.images, state.drafts, state.transcript, state.moderated = images, drafts, transcript, moderated
+        state.started = True
+        state.closed = False
+        state.mark = None
+        return state
+
+    def _load_snapshots(self):
+        if self.data_dir is None:
+            return
+        path = self.data_dir / "snapshots.json"
+        if not path.is_file():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 读取草稿快照失败：{e}")
+            return
+        if isinstance(data, dict):
+            self.snapshots = {k: v for k, v in data.items() if isinstance(v, dict) and "state" in v}
+        self._purge_snapshots()
+
+    def _purge_snapshots(self) -> bool:
+        """删除超过保留期限的快照及其图片，返回是否有删除。"""
+        keep = max(0.0, float(self.config.get("restart_keep_days", 7))) * 86400
+        now = time.time()
+        expired = [k for k, v in self.snapshots.items() if now - float(v.get("saved_at", 0)) > keep]
+        for k in expired:
+            snap = self.snapshots.pop(k)
+            self._discard_images(self._restore_state(snap["state"]).images)
+        return bool(expired)
+
+    def _write_snapshots(self):
+        if self.data_dir is None:
+            return
+        self._purge_snapshots()
+        try:
+            (self.data_dir / "snapshots.json").write_text(
+                json.dumps(self.snapshots, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 保存草稿快照失败：{e}")
+
+    def _clean_orphan_images(self):
+        """删除上次运行残留、且不被任何快照引用的图片副本。"""
+        if self.image_dir is None:
+            return
+        keep = {
+            str(Path(img.get("local_path", "")))
+            for snap in self.snapshots.values()
+            for img in snap["state"].get("images", [])
+            if img.get("local_path")
+        }
+        for f in self.image_dir.iterdir():
+            if f.is_file() and str(f) not in keep:
+                f.unlink(missing_ok=True)
 
     async def _on_session_message(
         self,
@@ -591,6 +797,10 @@ class AutoIssuePlugin(Star):
             return
 
         timeout = self._wait_timeout(state, timeout)
+
+        if self._match_restart(event):
+            await event.send(event.plain_result("本群当前已有进行中的 issue 收集，请先完成或「取消」后再重启。"))
+            return
 
         # 会话中也允许使用查询类子指令，不计入对话
         if is_cmd and event.is_at_or_wake_command:
@@ -829,6 +1039,7 @@ class AutoIssuePlugin(Star):
                 lines.append(f"【{i}】{d.title}" + (f"（可能相关：{refs}）" if refs else ""))
             lines += ["", self._action_tip(state)]
             controller.keep(timeout=timeout, reset_timeout=True)
+            self._save_snapshot(state)
         else:
             lines.append("感谢反馈！")
             state.closed = True
@@ -951,6 +1162,7 @@ class AutoIssuePlugin(Star):
                 preview = f"⚠️ 已移除 {len(removed)} 个未通过内容审核的草稿：{reasons}\n\n{preview}"
             # 相关 issue 的标题和摘要来自仓库，也要屏蔽违禁词
             await event.send(event.plain_result(self._mask_banned(preview)))
+            self._save_snapshot(state)
             return
 
         message = self._mask_banned(str(result.get("message") or "").strip())
@@ -1848,6 +2060,9 @@ class AutoIssuePlugin(Star):
             + ("某个草稿，或「取消」放弃全部。" if multi else "该草稿，或「取消」结束本次收集。")
         )
         lines.append(f"需要修改时直接回复修改意见，然后由发起人发送「{CONTINUE_WORD}」。")
+        if not state.preview_id:
+            state.preview_id = f"IS-{uuid.uuid4().hex[:8].upper()}"
+        lines.append(f"{PREVIEW_ID_PREFIX}{state.preview_id}")
         return "\n".join(lines)
 
     def _available_labels(self) -> list[str]:

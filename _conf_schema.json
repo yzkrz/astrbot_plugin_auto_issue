@@ -71,6 +71,12 @@
     "default": 1800,
     "hint": "出草稿后等待管理员审核的时间，期间无人发言也不会超时，避免管理员不在线时草稿丢失"
   },
+  "restart_keep_days": {
+    "description": "过期草稿保留天数",
+    "type": "float",
+    "default": 7,
+    "hint": "会话超时后草稿会保留这么多天，期间管理员可以引用草稿预览消息发送「重启」恢复。超过期限自动删除"
+  },
   "github_api_base": {
     "description": "GitHub API 地址",
     "type": "string",
