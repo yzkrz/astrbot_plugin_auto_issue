@@ -440,7 +440,7 @@ class IssueSessionFilter(SessionFilter):
     PLUGIN_NAME,
     "YourName",
     "群聊需求转 GitHub Issue：AI 多轮追问补全细节，预览确认后发布",
-    "1.8.2",
+    "1.8.3",
 )
 class AutoIssuePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -1356,7 +1356,7 @@ class AutoIssuePlugin(Star):
         )
         data = self._extract_json(resp.completion_text or "")
         if not data or "injected" not in data:
-            raise RuntimeError("人格检查结果格式异常")
+            raise RuntimeError("输出结果格式异常")
         injected = data["injected"] is True or str(data["injected"]).strip().lower() == "true"
         if not injected:
             return "", ""
